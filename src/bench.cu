@@ -85,16 +85,21 @@ int main()
     CHECK_CUBLAS(cublasSetStream(handle, stream));
 
     constexpr int BM = 128, BN = 128, BK = 64, NUM_STAGES = 2, CWG = 1;
+    constexpr int MMA_CWG = 2, MMA_WARP_M = 32, MMA_WARP_N = 64;
     // int M = 4096, N = 1024, K = 512;
     std::vector<std::tuple<int, int, int>> test_cases = {
-        // {128, 128, 128},
-        // {1024, 128, 128},
-        // {1024, 256, 128},
-        // {256, 256, 256},
-        // {512, 512, 512},
-        // {1024, 1024, 1024},
-        // {2048, 2048, 2048},
+        {128, 128, 128},
+        {1024, 128, 128},
+        {1024, 256, 128},
+        {256, 256, 256},
+        {512, 512, 512},
+        {1024, 1024, 1024},
+        {2048, 2048, 2048},
         {4096, 4096, 4096},
+        {8192, 8192, 8192},
+        // llama3 8b shapes
+        {4096, 14336 * 2, 4096}, // upgate
+        {4096, 4096, 14336} // downproj
     };
     for (auto &&[M, N, K] : test_cases)
     {
@@ -138,7 +143,7 @@ int main()
 
         // Our MMA kernel
         CHECK_CUDA(cudaMemsetAsync(d_Y.data, 0, M * N * sizeof(bf16), stream));
-        BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG>::run(M, N, K, d_X.data, d_W.data, d_Y.data, stream);
+        BF16GemmMMA<BM, BN, BK, NUM_STAGES, MMA_CWG, MMA_WARP_M, MMA_WARP_N>::run(M, N, K, d_X.data, d_W.data, d_Y.data, stream);
         CHECK_CUDA(cudaStreamSynchronize(stream));
 
         // Compare MMA
@@ -204,7 +209,7 @@ int main()
 
         double mma_ms = bench_ms([&]()
                                  { int b = buf_idx++ % NUM_BUFS;
-                                   BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG>::run(M, N, K, bench_X[b]->data, bench_W[b]->data, bench_Y[b]->data, stream); }, stream);
+                                   BF16GemmMMA<BM, BN, BK, NUM_STAGES, MMA_CWG, MMA_WARP_M, MMA_WARP_N>::run(M, N, K, bench_X[b]->data, bench_W[b]->data, bench_Y[b]->data, stream); }, stream);
 
         double cublas_tflops = flops / (cublas_ms * 1e-3) / 1e12;
         double simt_tflops = flops / (simt_ms * 1e-3) / 1e12;

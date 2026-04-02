@@ -544,7 +544,8 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
     {
         for (int s = 0; s < NUM_STAGES; s++)
         {
-            mbarrier_init(&smem.full_barrier[s], CWG);
+            // full_barrier: only the producer's expect_tx arrives (count=1)
+            mbarrier_init(&smem.full_barrier[s], 1);
             mbarrier_init(&smem.empty_barrier[s], CWG * P::WARPS_PER_WG);
         }
     }
@@ -706,11 +707,12 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
             // Wait for any previous TMA store before writing to smem.Y_out
             if (has_tma_store_in_flight)
             {
-                if (warp_in_wg == 0 && lane_id == 0)
+                if (cwg_id == 0 && warp_in_wg == 0 && lane_id == 0)
                 {
                     tma_store_wait();
                 }
-                asm volatile("bar.sync %0, %1;" :: "r"(wg_id), "r"(P::THREADS_PER_WG) : "memory");
+                // Sync ALL consumer WGs so everyone sees the wait complete
+                asm volatile("bar.sync %0, %1;" :: "r"(P::TOTAL_WGS), "r"(CWG * P::THREADS_PER_WG) : "memory");
             }
 
             bf16 *sY = smem.Y_out;
@@ -732,11 +734,11 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
                 }
             }
 
-            // Warpgroup sync before TMA store
-            asm volatile("bar.sync %0, %1;" :: "r"(wg_id), "r"(P::THREADS_PER_WG) : "memory");
+            // Sync all consumers before TMA store
+            asm volatile("bar.sync %0, %1;" :: "r"(P::TOTAL_WGS), "r"(CWG * P::THREADS_PER_WG) : "memory");
 
-            // TMA store: one thread per consumer warp group issues the store
-            if (warp_in_wg == 0 && lane_id == 0)
+            // TMA store: one thread issues the store
+            if (cwg_id == 0 && warp_in_wg == 0 && lane_id == 0)
             {
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 tma_store_2d(
@@ -749,7 +751,7 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
         } // end consumer tile loop
 
         // Wait for last TMA store before exit
-        if (warp_in_wg == 0 && lane_id == 0)
+        if (cwg_id == 0 && warp_in_wg == 0 && lane_id == 0)
         {
             if (has_tma_store_in_flight)
             {
