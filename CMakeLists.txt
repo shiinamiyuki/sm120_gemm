@@ -8,12 +8,13 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 find_package(CUDAToolkit REQUIRED)
 
-set(CMAKE_CUDA_ARCHITECTURES 120)
+set(CMAKE_CUDA_ARCHITECTURES 120a)
 
 add_executable(bench src/bench.cu)
 
 target_compile_options(bench PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
+        --use_fast_math
         --ptxas-options=-v,-warn-spills
     >
 )

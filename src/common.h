@@ -1,5 +1,6 @@
 #pragma once
 #include <cuda.h>
+#include <cstdio>
 #include <vector>
 #define CHECK_CUDA(call)                                                                                       \
     do                                                                                                         \
