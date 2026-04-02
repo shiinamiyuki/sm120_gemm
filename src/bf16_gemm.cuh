@@ -177,16 +177,20 @@ struct BF16GemmSIMT {
     static constexpr int TOTAL_WGS        = CWG + 1;
     static constexpr int TOTAL_THREADS    = TOTAL_WGS * THREADS_PER_WG;
 
-    static constexpr int X_STAGE_BYTES    = BM * BK * sizeof(bf16);
-    static constexpr int W_STAGE_BYTES    = BK * BN * sizeof(bf16);
-    static constexpr int STAGE_BYTES      = X_STAGE_BYTES + W_STAGE_BYTES;
-    static constexpr int TX_BYTES         = X_STAGE_BYTES + W_STAGE_BYTES;
-    static constexpr int BARRIER_OFFSET   = NUM_STAGES * STAGE_BYTES;
-    static constexpr int SMEM_SIZE        = BARRIER_OFFSET + 2 * NUM_STAGES * sizeof(uint64_t);
+    static constexpr int TX_BYTES         = (BM * BK + BK * BN) * sizeof(bf16);
 
     static constexpr int ROWS_PER_CWG     = BM / CWG;
     static constexpr int ELEMS_PER_CWG    = ROWS_PER_CWG * BN;
     static constexpr int ELEMS_PER_THREAD = ELEMS_PER_CWG / THREADS_PER_WG;
+
+    struct SMemStorage {
+        bf16 X[NUM_STAGES][BM * BK];
+        bf16 W[NUM_STAGES][BK * BN];
+        uint64_t full_barrier[NUM_STAGES];
+        uint64_t empty_barrier[NUM_STAGES];
+    };
+
+    static constexpr int SMEM_SIZE = sizeof(SMemStorage);
 
     static void run(
         int M, int N, int K,
@@ -207,18 +211,10 @@ bf16_gemm_kernel(
 )
 {
     using P = BF16GemmSIMT<BM, BN, BK, NUM_STAGES, CWG>;
+    using SmemStorage = typename P::SMemStorage;
 
     extern __shared__ __align__(128) char smem_raw[];
-
-    auto shared_X = [&](int stage) -> bf16* {
-        return reinterpret_cast<bf16*>(smem_raw + stage * P::STAGE_BYTES);
-    };
-    auto shared_W = [&](int stage) -> bf16* {
-        return reinterpret_cast<bf16*>(smem_raw + stage * P::STAGE_BYTES + P::X_STAGE_BYTES);
-    };
-
-    uint64_t* full_barrier  = reinterpret_cast<uint64_t*>(smem_raw + P::BARRIER_OFFSET);
-    uint64_t* empty_barrier = reinterpret_cast<uint64_t*>(smem_raw + P::BARRIER_OFFSET + NUM_STAGES * sizeof(uint64_t));
+    auto& smem = *reinterpret_cast<SmemStorage*>(smem_raw);
 
     const int tid        = threadIdx.x;
     const int warp_id    = tid / P::THREADS_PER_WARP;
@@ -233,8 +229,8 @@ bf16_gemm_kernel(
     // ── Initialize barriers ────────────────────────────────────────
     if (tid == 0) {
         for (int s = 0; s < NUM_STAGES; s++) {
-            mbarrier_init(&full_barrier[s], CWG);
-            mbarrier_init(&empty_barrier[s], CWG * P::WARPS_PER_WG);
+            mbarrier_init(&smem.full_barrier[s], CWG);
+            mbarrier_init(&smem.empty_barrier[s], CWG * P::WARPS_PER_WG);
         }
     }
     __syncthreads();
@@ -250,23 +246,21 @@ bf16_gemm_kernel(
 
             for (int k = 0; k < num_k_tiles; k++) {
                 if (k >= NUM_STAGES) {
-                    // Wait for consumer to finish the PREVIOUS use of this stage.
-                    // Consumer's arrive completed the prior phase, so check phase^1.
-                    mbarrier_wait(smem_u32(&empty_barrier[stage]), phase ^ 1);
+                    mbarrier_wait(smem_u32(&smem.empty_barrier[stage]), phase ^ 1);
                 }
 
-                mbarrier_expect_tx(smem_u32(&full_barrier[stage]), P::TX_BYTES);
+                mbarrier_expect_tx(smem_u32(&smem.full_barrier[stage]), P::TX_BYTES);
 
                 const_cast<TMADescriptor&>(tma_X).load_2d(
                     k * BK, bm * BM,
-                    smem_u32(shared_X(stage)),
-                    smem_u32(&full_barrier[stage])
+                    smem_u32(smem.X[stage]),
+                    smem_u32(&smem.full_barrier[stage])
                 );
 
                 const_cast<TMADescriptor&>(tma_W).load_2d(
                     k * BK, bn * BN,
-                    smem_u32(shared_W(stage)),
-                    smem_u32(&full_barrier[stage])
+                    smem_u32(smem.W[stage]),
+                    smem_u32(&smem.full_barrier[stage])
                 );
 
                 stage++;
@@ -292,10 +286,10 @@ bf16_gemm_kernel(
         int phase = 0;
 
         for (int k = 0; k < num_k_tiles; k++) {
-            mbarrier_wait(smem_u32(&full_barrier[stage]), phase);
+            mbarrier_wait(smem_u32(&smem.full_barrier[stage]), phase);
 
-            const bf16* sX = shared_X(stage);
-            const bf16* sW = shared_W(stage);
+            const bf16* sX = smem.X[stage];
+            const bf16* sW = smem.W[stage];
 
             for (int i = 0; i < P::ELEMS_PER_THREAD; i++) {
                 int linear  = tid_in_wg + i * P::THREADS_PER_WG;
@@ -313,7 +307,7 @@ bf16_gemm_kernel(
             }
 
             if (lane_id == 0) {
-                mbarrier_arrive(smem_u32(&empty_barrier[stage]));
+                mbarrier_arrive(smem_u32(&smem.empty_barrier[stage]));
             }
 
             stage++;
@@ -340,8 +334,8 @@ bf16_gemm_kernel(
     __syncthreads();
     if (tid == 0) {
         for (int s = 0; s < NUM_STAGES; s++) {
-            mbarrier_inval(&full_barrier[s]);
-            mbarrier_inval(&empty_barrier[s]);
+            mbarrier_inval(&smem.full_barrier[s]);
+            mbarrier_inval(&smem.empty_barrier[s]);
         }
     }
 }
@@ -394,27 +388,29 @@ struct BF16GemmMMA {
     static constexpr int TOTAL_WGS        = CWG + 1;
     static constexpr int TOTAL_THREADS    = TOTAL_WGS * THREADS_PER_WG;
 
-    static constexpr int X_STAGE_BYTES    = BM * BK * sizeof(bf16);
-    static constexpr int W_STAGE_BYTES    = BK * BN * sizeof(bf16);
-    static constexpr int STAGE_BYTES      = X_STAGE_BYTES + W_STAGE_BYTES;
-    static constexpr int TX_BYTES         = X_STAGE_BYTES + W_STAGE_BYTES;
-    static constexpr int BARRIER_OFFSET   = NUM_STAGES * STAGE_BYTES;
-    static constexpr int SMEM_SIZE        = BARRIER_OFFSET + 2 * NUM_STAGES * sizeof(uint64_t);
+    static constexpr int TX_BYTES         = (BM * BK + BK * BN) * sizeof(bf16);
 
     // Warp tiling
     static constexpr int NUM_CONSUMER_WARPS = CWG * WARPS_PER_WG;
-    static constexpr int MMA_M = WARP_M / 16;  // number of m16 tiles per warp
-    static constexpr int MMA_N = WARP_N / 8;   // number of n8 tiles per warp
-    static constexpr int MMA_K = BK / 16;      // k-inner steps per pipeline stage
+    static constexpr int MMA_M = WARP_M / 16;
+    static constexpr int MMA_N = WARP_N / 8;
+    static constexpr int MMA_K = BK / 16;
 
-    // Warp grid over BM×BN
     static constexpr int WARPS_M = BM / WARP_M;
     static constexpr int WARPS_N = BN / WARP_N;
     static_assert(WARPS_M * WARPS_N == NUM_CONSUMER_WARPS,
                   "Warp tiling must cover BM×BN exactly");
 
-    // Each warp accumulates MMA_M * MMA_N tiles, each 4 f32 regs
     static constexpr int ACC_REGS = MMA_M * MMA_N * 4;
+
+    struct SMemStorage {
+        bf16 X[NUM_STAGES][BM * BK];
+        bf16 W[NUM_STAGES][BK * BN];
+        uint64_t full_barrier[NUM_STAGES];
+        uint64_t empty_barrier[NUM_STAGES];
+    };
+
+    static constexpr int SMEM_SIZE = sizeof(SMemStorage);
 
     static void run(
         int M, int N, int K,
@@ -435,18 +431,10 @@ bf16_gemm_mma_kernel(
 )
 {
     using P = BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N>;
+    using SmemStorage = typename P::SMemStorage;
 
     extern __shared__ __align__(128) char smem_raw[];
-
-    auto shared_X = [&](int stage) -> bf16* {
-        return reinterpret_cast<bf16*>(smem_raw + stage * P::STAGE_BYTES);
-    };
-    auto shared_W = [&](int stage) -> bf16* {
-        return reinterpret_cast<bf16*>(smem_raw + stage * P::STAGE_BYTES + P::X_STAGE_BYTES);
-    };
-
-    uint64_t* full_barrier  = reinterpret_cast<uint64_t*>(smem_raw + P::BARRIER_OFFSET);
-    uint64_t* empty_barrier = reinterpret_cast<uint64_t*>(smem_raw + P::BARRIER_OFFSET + NUM_STAGES * sizeof(uint64_t));
+    auto& smem = *reinterpret_cast<SmemStorage*>(smem_raw);
 
     const int tid        = threadIdx.x;
     const int warp_id    = tid / P::THREADS_PER_WARP;
@@ -461,8 +449,8 @@ bf16_gemm_mma_kernel(
     // ── Initialize barriers ────────────────────────────────────────
     if (tid == 0) {
         for (int s = 0; s < NUM_STAGES; s++) {
-            mbarrier_init(&full_barrier[s], CWG);
-            mbarrier_init(&empty_barrier[s], CWG * P::WARPS_PER_WG);
+            mbarrier_init(&smem.full_barrier[s], CWG);
+            mbarrier_init(&smem.empty_barrier[s], CWG * P::WARPS_PER_WG);
         }
     }
     __syncthreads();
@@ -478,23 +466,21 @@ bf16_gemm_mma_kernel(
 
             for (int k = 0; k < num_k_tiles; k++) {
                 if (k >= NUM_STAGES) {
-                    // Wait for consumer to finish the PREVIOUS use of this stage.
-                    // Consumer's arrive completed the prior phase, so check phase^1.
-                    mbarrier_wait(smem_u32(&empty_barrier[stage]), phase ^ 1);
+                    mbarrier_wait(smem_u32(&smem.empty_barrier[stage]), phase ^ 1);
                 }
 
-                mbarrier_expect_tx(smem_u32(&full_barrier[stage]), P::TX_BYTES);
+                mbarrier_expect_tx(smem_u32(&smem.full_barrier[stage]), P::TX_BYTES);
 
                 const_cast<TMADescriptor&>(tma_X).load_2d(
                     k * BK, bm * BM,
-                    smem_u32(shared_X(stage)),
-                    smem_u32(&full_barrier[stage])
+                    smem_u32(smem.X[stage]),
+                    smem_u32(&smem.full_barrier[stage])
                 );
 
                 const_cast<TMADescriptor&>(tma_W).load_2d(
                     k * BK, bn * BN,
-                    smem_u32(shared_W(stage)),
-                    smem_u32(&full_barrier[stage])
+                    smem_u32(smem.W[stage]),
+                    smem_u32(&smem.full_barrier[stage])
                 );
 
                 stage++;
@@ -509,20 +495,17 @@ bf16_gemm_mma_kernel(
     else {
         // asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n" :::);
 
-        // Which consumer warp are we within the consumer warp groups?
         const int cwg_id        = wg_id - 1;
         const int consumer_warp = cwg_id * P::WARPS_PER_WG + warp_in_wg;
-        const int warp_row      = consumer_warp / P::WARPS_N; // which warp row in the BM×BN grid
-        const int warp_col      = consumer_warp % P::WARPS_N; // which warp col
+        const int warp_row      = consumer_warp / P::WARPS_N;
+        const int warp_col      = consumer_warp % P::WARPS_N;
 
-        const int m_warp_base   = warp_row * WARP_M;  // first m-row of this warp's tile
-        const int n_warp_base   = warp_col * WARP_N;  // first n-col of this warp's tile
+        const int m_warp_base   = warp_row * WARP_M;
+        const int n_warp_base   = warp_col * WARP_N;
 
-        // MMA fragment layout helpers
         const int groupID          = lane_id >> 2;
         const int threadID_in_group = lane_id & 3;
 
-        // Accumulators: MMA_M * MMA_N tiles, 4 f32 each
         float acc[P::MMA_M][P::MMA_N][4];
         for (int mi = 0; mi < P::MMA_M; mi++)
             for (int ni = 0; ni < P::MMA_N; ni++)
@@ -531,67 +514,48 @@ bf16_gemm_mma_kernel(
 
         int stage = 0;
         int phase = 0;
-        const int tid_in_wg = warp_in_wg * P::THREADS_PER_WARP + lane_id;
 
         for (int k = 0; k < num_k_tiles; k++) {
-            mbarrier_wait(smem_u32(&full_barrier[stage]), phase);
+            mbarrier_wait(smem_u32(&smem.full_barrier[stage]), phase);
 
-            const bf16* sX = shared_X(stage);
-            const bf16* sW = shared_W(stage);
+            const bf16* sX = smem.X[stage];
+            const bf16* sW = smem.W[stage];
 
-            // For each k-inner step (16 elements at a time)
             for (int ki = 0; ki < P::MMA_K; ki++) {
                 const int k_base = ki * 16;
 
-                // For each MMA tile in this warp's region
                 for (int mi = 0; mi < P::MMA_M; mi++) {
                     const int m_base = m_warp_base + mi * 16;
 
                     for (int ni = 0; ni < P::MMA_N; ni++) {
                         const int n_base = n_warp_base + ni * 8;
 
-                        // Load A fragment (4 .f16x2 registers = 8 bf16 values)
-                        // sX layout: sX[m * BK + k], row-major BM×BK
-                        // A is m16×k16 row-major
                         uint32_t a[4];
                         {
-                            // reg0 {a0,a1}: row=groupID, col=tid_in_grp*2+{0,1}
                             int r0 = m_base + groupID;
                             int c0 = k_base + threadID_in_group * 2;
-                            bf16 a0 = sX[r0 * BK + c0];
-                            bf16 a1 = sX[r0 * BK + c0 + 1];
-                            a[0] = bf16x2_as_u32(a0, a1);
+                            a[0] = bf16x2_as_u32(sX[r0 * BK + c0], sX[r0 * BK + c0 + 1]);
 
-                            // reg1 {a2,a3}: row=groupID+8, col=tid_in_grp*2+{0,1}
                             int r1 = m_base + groupID + 8;
                             a[1] = bf16x2_as_u32(sX[r1 * BK + c0], sX[r1 * BK + c0 + 1]);
 
-                            // reg2 {a4,a5}: row=groupID, col=tid_in_grp*2+8+{0,1}
                             int c1 = k_base + threadID_in_group * 2 + 8;
                             a[2] = bf16x2_as_u32(sX[r0 * BK + c1], sX[r0 * BK + c1 + 1]);
-
-                            // reg3 {a6,a7}: row=groupID+8, col=tid_in_grp*2+8+{0,1}
                             a[3] = bf16x2_as_u32(sX[r1 * BK + c1], sX[r1 * BK + c1 + 1]);
                         }
 
-                        // Load B fragment (2 .f16x2 registers = 4 bf16 values)
-                        // sW layout: sW[n * BK + k], which is BN×BK
-                        // B is k16×n8 col-major, so B[k][n] = sW[n * BK + k]
                         uint32_t b[2];
                         {
-                            // reg0 {b0,b1}: row=tid_in_grp*2+{0,1}, col=groupID
                             int bk0 = k_base + threadID_in_group * 2;
                             int bn0 = n_base + groupID;
                             b[0] = bf16x2_as_u32(
                                 sW[bn0 * BK + bk0], sW[bn0 * BK + bk0 + 1]);
 
-                            // reg1 {b2,b3}: row=tid_in_grp*2+8+{0,1}, col=groupID
                             int bk1 = k_base + threadID_in_group * 2 + 8;
                             b[1] = bf16x2_as_u32(
                                 sW[bn0 * BK + bk1], sW[bn0 * BK + bk1 + 1]);
                         }
 
-                        // MMA
                         asm volatile(
                             "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                             "{%0, %1, %2, %3}, "
@@ -610,7 +574,7 @@ bf16_gemm_mma_kernel(
             }
 
             if (lane_id == 0) {
-                mbarrier_arrive(smem_u32(&empty_barrier[stage]));
+                mbarrier_arrive(smem_u32(&smem.empty_barrier[stage]));
             }
 
             stage++;
@@ -623,11 +587,6 @@ bf16_gemm_mma_kernel(
         // ── Store output ───────────────────────────────────────────
         __syncthreads();
 
-        // Accumulator layout for C/D (m16n8, f32):
-        //   c0: row=groupID,     col=tid_in_grp*2
-        //   c1: row=groupID,     col=tid_in_grp*2+1
-        //   c2: row=groupID+8,   col=tid_in_grp*2
-        //   c3: row=groupID+8,   col=tid_in_grp*2+1
         for (int mi = 0; mi < P::MMA_M; mi++) {
             for (int ni = 0; ni < P::MMA_N; ni++) {
                 int m_base = bm * BM + m_warp_base + mi * 16;
@@ -650,8 +609,8 @@ bf16_gemm_mma_kernel(
     __syncthreads();
     if (tid == 0) {
         for (int s = 0; s < NUM_STAGES; s++) {
-            mbarrier_inval(&full_barrier[s]);
-            mbarrier_inval(&empty_barrier[s]);
+            mbarrier_inval(&smem.full_barrier[s]);
+            mbarrier_inval(&smem.empty_barrier[s]);
         }
     }
 }
