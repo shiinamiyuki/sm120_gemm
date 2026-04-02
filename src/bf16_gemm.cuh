@@ -35,6 +35,30 @@ struct TMADescriptor {
     }
 };
 
+// cp.async.bulk.tensor.2d.global.shared::cta (TMA store)
+__device__ __forceinline__ void tma_store_2d(
+    const uint64_t* tma_desc,
+    uint32_t tile_coord0, uint32_t tile_coord1,
+    uint64_t smem_addr)
+{
+    asm volatile(
+        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group"
+        " [%0, {%1, %2}], [%3];"
+        ::
+        "l"(tma_desc), "r"(tile_coord0), "r"(tile_coord1),
+        "l"(smem_addr)
+        : "memory"
+    );
+}
+
+__device__ __forceinline__ void tma_store_arrive() {
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+}
+
+__device__ __forceinline__ void tma_store_wait() {
+    asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+}
+
 // Host-side: create a 2D TMA descriptor for a row-major or column-major bf16 matrix
 // globalDim0 = inner-most (contiguous) dimension, globalDim1 = outer dimension
 // boxDim0 / boxDim1 = tile sizes along each dimension
@@ -406,6 +430,7 @@ struct BF16GemmMMA {
     struct SMemStorage {
         bf16 X[NUM_STAGES][BM * BK];
         bf16 W[NUM_STAGES][BK * BN];
+        bf16 Y_out[BM * BN];
         uint64_t full_barrier[NUM_STAGES];
         uint64_t empty_barrier[NUM_STAGES];
     };
@@ -427,6 +452,7 @@ bf16_gemm_mma_kernel(
     int M, int N, int K,
     __grid_constant__ const TMADescriptor tma_X,
     __grid_constant__ const TMADescriptor tma_W,
+    __grid_constant__ const TMADescriptor tma_Y,
     bf16 *__restrict__ Y
 )
 {
@@ -584,24 +610,60 @@ bf16_gemm_mma_kernel(
             }
         }
 
-        // ── Store output ───────────────────────────────────────────
-        __syncthreads();
+        // ── Store output via stmatrix + TMA store ──────────────────
+        // Warpgroup sync: bar.sync with bar_id = wg_id
+        asm volatile("bar.sync %0, %1;" :: "r"(wg_id), "r"(P::THREADS_PER_WG) : "memory");
+
+        // Convert f32 accumulators to bf16 and use stmatrix to write to smem
+        // Each warp writes its WARP_M × WARP_N region into smem.Y_out
+        // smem.Y_out is BM×BN row-major (matches output layout: dim0=N, dim1=M for TMA)
+        bf16* sY = smem.Y_out;
 
         for (int mi = 0; mi < P::MMA_M; mi++) {
             for (int ni = 0; ni < P::MMA_N; ni++) {
-                int m_base = bm * BM + m_warp_base + mi * 16;
-                int n_base = bn * BN + n_warp_base + ni * 8;
+                // MMA output layout: m16n8
+                // c0: row=groupID,   col=tid_in_grp*2
+                // c1: row=groupID,   col=tid_in_grp*2+1
+                // c2: row=groupID+8, col=tid_in_grp*2
+                // c3: row=groupID+8, col=tid_in_grp*2+1
+                int m_base = m_warp_base + mi * 16;
+                int n_base = n_warp_base + ni * 8;
 
-                int gm0 = m_base + groupID;
-                int gm1 = m_base + groupID + 8;
-                int gn0 = n_base + threadID_in_group * 2;
-                int gn1 = gn0 + 1;
+                // Pack two bf16 values into one register for stmatrix
+                // We have 4 f32 accumulators per MMA tile
+                // Row 0: (groupID, tid_in_grp*2) and (groupID, tid_in_grp*2+1)
+                uint32_t out0 = bf16x2_as_u32(bf16(acc[mi][ni][0]), bf16(acc[mi][ni][1]));
+                // Row 1: (groupID+8, tid_in_grp*2) and (groupID+8, tid_in_grp*2+1)
+                uint32_t out1 = bf16x2_as_u32(bf16(acc[mi][ni][2]), bf16(acc[mi][ni][3]));
 
-                Y[gm0 * N + gn0] = bf16(acc[mi][ni][0]);
-                Y[gm0 * N + gn1] = bf16(acc[mi][ni][1]);
-                Y[gm1 * N + gn0] = bf16(acc[mi][ni][2]);
-                Y[gm1 * N + gn1] = bf16(acc[mi][ni][3]);
+                // Write using stmatrix.sync.aligned.m8n8.x2.shared.b16
+                // stmatrix stores an 8×8 matrix (bf16) from 32 threads
+                // Each thread contributes one .b32 register = 2 bf16 values
+                // Thread mapping for m8n8: thread t owns row (t % 8), col (t/8)*2 and (t/8)*2+1... not quite
+                // Actually for m16n8, we just write directly for now
+                int sm0 = m_base + groupID;
+                int sn0 = n_base + threadID_in_group * 2;
+                sY[sm0 * BN + sn0]     = bf16(acc[mi][ni][0]);
+                sY[sm0 * BN + sn0 + 1] = bf16(acc[mi][ni][1]);
+                int sm1 = m_base + groupID + 8;
+                sY[sm1 * BN + sn0]     = bf16(acc[mi][ni][2]);
+                sY[sm1 * BN + sn0 + 1] = bf16(acc[mi][ni][3]);
             }
+        }
+
+        // Warpgroup sync before TMA store
+        asm volatile("bar.sync %0, %1;" :: "r"(wg_id), "r"(P::THREADS_PER_WG) : "memory");
+
+        // TMA store: one thread per consumer warp group issues the store
+        if (warp_in_wg == 0 && lane_id == 0) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            tma_store_2d(
+                reinterpret_cast<const uint64_t*>(tma_Y.raw),
+                bn * BN, bm * BM,
+                smem_u32(sY)
+            );
+            tma_store_arrive();
+            tma_store_wait();
         }
     }
 
@@ -630,6 +692,8 @@ void BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N>::run(
 
     TMADescriptor tma_X = create_tma_desc_2d(X, K, M, BK, BM);
     TMADescriptor tma_W = create_tma_desc_2d(W, K, N, BK, BN);
+    // Y is row-major M×N, so dim0 (contiguous) = N, dim1 = M, box = BN×BM
+    TMADescriptor tma_Y = create_tma_desc_2d(Y, N, M, BN, BM);
 
     dim3 grid(M / BM, N / BN, 1);
     dim3 block(TOTAL_THREADS);
@@ -637,7 +701,7 @@ void BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N>::run(
     CHECK_CUDA(cudaFuncSetAttribute(bf16_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE));
     bf16_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N><<<grid, block, SMEM_SIZE, stream>>>(
-        M, N, K, tma_X, tma_W, Y
+        M, N, K, tma_X, tma_W, tma_Y, Y
     );
     CHECK_CUDA(cudaGetLastError());
 }
