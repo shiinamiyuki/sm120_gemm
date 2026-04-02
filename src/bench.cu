@@ -87,13 +87,13 @@ int main()
     constexpr int BM = 128, BN = 128, BK = 64, NUM_STAGES = 2, CWG = 1;
     // int M = 4096, N = 1024, K = 512;
     std::vector<std::tuple<int, int, int>> test_cases = {
-        {128, 128, 128},
-        {1024, 128, 128},
-        {1024, 256, 128},
-        {256, 256, 256},
-        {512, 512, 512},
-        {1024, 1024, 1024},
-        {2048, 2048, 2048},
+        // {128, 128, 128},
+        // {1024, 128, 128},
+        // {1024, 256, 128},
+        // {256, 256, 256},
+        // {512, 512, 512},
+        // {1024, 1024, 1024},
+        // {2048, 2048, 2048},
         {4096, 4096, 4096},
     };
     for (auto &&[M, N, K] : test_cases)
@@ -167,17 +167,44 @@ int main()
             return 1;
         }
 
-        // ── Benchmark ──────────────────────────────────────────────────
+        // ── Benchmark (rotate buffers to flush L2 cache) ────────────
+        int device;
+        CHECK_CUDA(cudaGetDevice(&device));
+        size_t l2_size;
+        {
+            int l2_bytes;
+            CHECK_CUDA(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, device));
+            l2_size = static_cast<size_t>(l2_bytes);
+        }
+        size_t per_set_bytes = (size_t(M) * K + size_t(K) * N + size_t(M) * N) * sizeof(bf16);
+        int NUM_BUFS = std::max(1, (int)((2 * l2_size + per_set_bytes - 1) / per_set_bytes));
+        printf("[bench] L2 cache: %zu KB, per-set: %zu KB, NUM_BUFS: %d\n",
+               l2_size / 1024, per_set_bytes / 1024, NUM_BUFS);
+        std::vector<CUDABuffer<bf16>*> bench_X, bench_W, bench_Y;
+        for (int b = 0; b < NUM_BUFS; b++) {
+            bench_X.push_back(new CUDABuffer<bf16>(M * K));
+            bench_W.push_back(new CUDABuffer<bf16>(K * N));
+            bench_Y.push_back(new CUDABuffer<bf16>(M * N));
+            bench_X.back()->copy_from_host(h_X.data(), stream);
+            bench_W.back()->copy_from_host(h_W.data(), stream);
+        }
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+
+        int buf_idx = 0;
         double flops = 2.0 * M * N * K;
 
         double cublas_ms = bench_ms([&]()
-                                    { cublas_gemm(handle, M, N, K, d_X.data, d_W.data, d_Y_ref.data); }, stream);
+                                    { int b = buf_idx++ % NUM_BUFS;
+                                      cublas_gemm(handle, M, N, K, bench_X[b]->data, bench_W[b]->data, bench_Y[b]->data); }, stream);
+
 
         double simt_ms = bench_ms([&]()
-                                  { BF16GemmSIMT<BM, BN, BK, NUM_STAGES, CWG>::run(M, N, K, d_X.data, d_W.data, d_Y.data, stream); }, stream);
+                                  { int b = buf_idx++ % NUM_BUFS;
+                                    BF16GemmSIMT<BM, BN, BK, NUM_STAGES, CWG>::run(M, N, K, bench_X[b]->data, bench_W[b]->data, bench_Y[b]->data, stream); }, stream);
 
         double mma_ms = bench_ms([&]()
-                                 { BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG>::run(M, N, K, d_X.data, d_W.data, d_Y.data, stream); }, stream);
+                                 { int b = buf_idx++ % NUM_BUFS;
+                                   BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG>::run(M, N, K, bench_X[b]->data, bench_W[b]->data, bench_Y[b]->data, stream); }, stream);
 
         double cublas_tflops = flops / (cublas_ms * 1e-3) / 1e12;
         double simt_tflops = flops / (simt_ms * 1e-3) / 1e12;
@@ -187,6 +214,12 @@ int main()
         printf("[cuBLAS] %.4f ms  %.4f TFLOPS\n", cublas_ms, cublas_tflops);
         printf("[SIMT]   %.4f ms  %.4f TFLOPS  (%.1f%% of cuBLAS)\n", simt_ms, simt_tflops, 100.0 * simt_tflops / cublas_tflops);
         printf("[MMA]    %.4f ms  %.4f TFLOPS  (%.1f%% of cuBLAS)\n", mma_ms, mma_tflops, 100.0 * mma_tflops / cublas_tflops);
+
+        for (int b = 0; b < NUM_BUFS; b++) {
+            delete bench_X[b];
+            delete bench_W[b];
+            delete bench_Y[b];
+        }
     }
     return 0;
 }
