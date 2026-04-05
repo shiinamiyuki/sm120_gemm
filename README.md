@@ -2,7 +2,7 @@
 
 A high-performance BF16 GEMM (General Matrix Multiply) implementation targeting NVIDIA RTX Blackwell (SM120) GPUs, written entirely in CUDA C++ with inline PTX. Achieves **100%+ of cuBLAS performance** on large matrix sizes, with no dependencies beyond the CUDA toolkit.
 
-Computes $Y = X \cdot W^T$ where $X$ is row-major $(M \times K)$ BF16, $W$ is column-major $(N \times K)$ BF16, and $Y$ is row-major $(M \times N)$ BF16, with accumulation in FP32.
+Computes $Y = X \cdot W^T$ where $X$ is $(M \times K)$ BF16, $W$ is $(N \times K)$ BF16, and $Y$ is $(M \times N)$ BF16, with accumulation in FP32.
 
 ## Key Optimizations
 - **TMA (Tensor Memory Accelerator)**: Uses `cp.async.bulk.tensor.2d` for both global→shared loads and shared→global stores, offloading data movement to a dedicated hardware unit.
