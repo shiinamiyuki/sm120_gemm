@@ -41,7 +41,6 @@ def generate_configs(max_smem_kb=128):
                                     warps_n = bn // wn
                                     if warps_m * warps_n != num_consumer_warps:
                                         continue
-                                    # Pick max stages that fits in smem
       
                                     sb = smem_bytes(bm, bn, bk, stages, sk)
                                     if sb > max_smem:
