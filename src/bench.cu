@@ -233,6 +233,7 @@ int bench_debug()
 
         // Our MMA Split-K kernel
         CUDABuffer<float> d_workspace(SPLIT_K * M * N);
+         CHECK_CUDA(cudaMemsetAsync(d_workspace.data, 0, SPLIT_K * M * N * sizeof(float), stream));
         CHECK_CUDA(cudaMemsetAsync(d_Y.data, 0, M * N * sizeof(bf16), stream));
         BF16GemmMMASplitK<BM, BN, BK, NUM_STAGES, MMA_CWG, MMA_WARP_M, MMA_WARP_N, SPLIT_K>::run(
             M, N, K, d_X.data, d_W.data, d_Y.data, d_workspace.data, stream);

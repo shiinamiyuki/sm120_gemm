@@ -297,6 +297,7 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
     // ── Producer warp group (wg_id == 0) ───────────────────────────
     if (wg_id == 0)
     {
+
         if (warp_in_wg == 0 && lane_id == 0)
         {
             int stage = 0;
@@ -358,11 +359,7 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
             int bm, bn;
             P::rasterize_tile(tile_id, num_tiles_m, num_tiles_n, bm, bn);
 
-            float acc[P::MMA_M][P::MMA_N][4];
-            for (int mi = 0; mi < P::MMA_M; mi++)
-                for (int ni = 0; ni < P::MMA_N; ni++)
-                    for (int r = 0; r < 4; r++)
-                        acc[mi][ni][r] = 0.0f;
+            float acc[P::MMA_M][P::MMA_N][4]{};
 
             for (int k = 0; k < num_k_tiles; k++)
             {
@@ -370,7 +367,7 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
 
                 const bf16 *sX = smem.X[stage];
                 const bf16 *sW = smem.W[stage];
-
+#pragma unroll
                 for (int ki = 0; ki < P::MMA_K; ki++)
                 {
                     const int k_base = ki * 16;
@@ -388,7 +385,7 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
                             : "=r"(b_frag[ni][0]), "=r"(b_frag[ni][1])
                             : "r"(b_addr));
                     }
-
+#pragma unroll
                     for (int mi = 0; mi < P::MMA_M; mi++)
                     {
                         const int m_base = m_warp_base + mi * 16;
@@ -404,7 +401,7 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
                                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
                                 : "r"(a_addr));
                         }
-
+#pragma unroll
                         for (int ni = 0; ni < P::MMA_N; ni++)
                         {
                             asm volatile(
@@ -643,9 +640,6 @@ __global__ void __launch_bounds__(BF16GemmMMASplitK<BM, BN, BK, NUM_STAGES, CWG,
     __syncthreads();
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
-    const int groupID = lane_id >> 2;
-    const int threadID_in_group = lane_id & 3;
-
     // ── Producer warp group (wg_id == 0) ───────────────────────────
     if (wg_id == 0)
     {
@@ -719,12 +713,7 @@ __global__ void __launch_bounds__(BF16GemmMMASplitK<BM, BN, BK, NUM_STAGES, CWG,
             int k_start = split_idx * num_k_per_split;
             int k_end = k_start + num_k_per_split;
 
-            float acc[P::MMA_M][P::MMA_N][4];
-            for (int mi = 0; mi < P::MMA_M; mi++)
-                for (int ni = 0; ni < P::MMA_N; ni++)
-                    for (int r = 0; r < 4; r++)
-                        acc[mi][ni][r] = 0.0f;
-
+            float acc[P::MMA_M][P::MMA_N][4]{};
             for (int k = k_start; k < k_end; k++)
             {
                 mbarrier_wait(smem_u32(&smem.full_barrier[stage]), phase);
@@ -796,24 +785,31 @@ __global__ void __launch_bounds__(BF16GemmMMASplitK<BM, BN, BK, NUM_STAGES, CWG,
                     phase ^= 1;
                 }
             }
-
-            // ── Write f32 partial results to workspace ─────────────
-            float *ws = workspace + (size_t)split_idx * M * N;
-
-            for (int mi = 0; mi < P::MMA_M; mi++)
+            // mysterious sync..
+            // otherwise it triggers a mysterious bug in split k
+            asm volatile("bar.sync %0, %1;" :: "r"(P::TOTAL_WGS), "r"(CWG * P::THREADS_PER_WG) : "memory");
+            // ── Store f32 partial results directly to global workspace ──
             {
-                for (int ni = 0; ni < P::MMA_N; ni++)
+                float *ws = workspace + (size_t)split_idx * M * N;
+                const int gm_base = bm * BM;
+                const int gn_base = bn * BN;
+#pragma unroll
+                for (int mi = 0; mi < P::MMA_M; mi++)
                 {
-                    int m_base = m_warp_base + mi * 16;
-                    int n_base = n_warp_base + ni * 8;
+#pragma unroll
+                    for (int ni = 0; ni < P::MMA_N; ni++)
+                    {
+                        int m_base = m_warp_base + mi * 16;
+                        int n_base = n_warp_base + ni * 8;
 
-                    int gm0 = bm * BM + m_base + groupID;
-                    int gn0 = bn * BN + n_base + threadID_in_group * 2;
-                    ws[gm0 * N + gn0]     = acc[mi][ni][0];
-                    ws[gm0 * N + gn0 + 1] = acc[mi][ni][1];
-                    int gm1 = gm0 + 8;
-                    ws[gm1 * N + gn0]     = acc[mi][ni][2];
-                    ws[gm1 * N + gn0 + 1] = acc[mi][ni][3];
+                        int row0 = gm_base + m_base + (lane_id >> 2);
+                        int col0 = gn_base + n_base + (lane_id & 3) * 2;
+                        ws[row0 * N + col0]     = acc[mi][ni][0];
+                        ws[row0 * N + col0 + 1] = acc[mi][ni][1];
+                        int row1 = row0 + 8;
+                        ws[row1 * N + col0]     = acc[mi][ni][2];
+                        ws[row1 * N + col0 + 1] = acc[mi][ni][3];
+                    }
                 }
             }
         } // end consumer tile loop
@@ -838,7 +834,7 @@ template <int SPLIT_K>
 __global__ void splitk_reduce_kernel(
     const float *__restrict__ workspace,
     bf16 *__restrict__ Y,
-    int MN)
+    size_t MN)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= MN) return;
@@ -891,9 +887,9 @@ void BF16GemmMMASplitK<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, SPLIT_K>::ru
     CHECK_CUDA(cudaGetLastError());
 
     // Reduction: sum SPLIT_K partials → bf16 output
-    constexpr int REDUCE_THREADS = 256;
-    int MN = M * N;
-    int reduce_blocks = (MN + REDUCE_THREADS - 1) / REDUCE_THREADS;
+    constexpr int REDUCE_THREADS = 512;
+    auto MN = (size_t)M * (size_t)N;
+    auto reduce_blocks = (MN + REDUCE_THREADS - 1) / REDUCE_THREADS;
     splitk_reduce_kernel<SPLIT_K><<<reduce_blocks, REDUCE_THREADS, 0, stream>>>(
         workspace, Y, MN);
     CHECK_CUDA(cudaGetLastError());
