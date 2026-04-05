@@ -161,6 +161,19 @@ bool check_result(const char *label, const bf16 *Y, const bf16 *Y_ref, const flo
     }
     return false;
 }
+ std::vector<std::tuple<int, int, int>> test_cases = {
+    {512, 512, 14336},
+    {1024, 1024, 14336},
+    {1024, 1024, 1024},
+    {2048, 2048, 2048},
+    {4096, 4096, 4096},
+    {8192, 8192, 8192},
+    // llama3 8b shapes
+    {4096, 14336 * 2, 4096}, // upgate
+    {4096, 4096, 14336},     // downproj
+    {128, 14336 * 2, 4096},  // upgate
+    {128, 4096, 14336}       // downproj
+};
 
 int bench_debug()
 {
@@ -174,22 +187,7 @@ int bench_debug()
     constexpr int MMA_CWG = 2, MMA_WARP_M = 32, MMA_WARP_N = 64;
     constexpr int SPLIT_K = 2;
     // int M = 4096, N = 1024, K = 512;
-    std::vector<std::tuple<int, int, int>> test_cases = {
-        {128, 128, 128},
-        {1024, 128, 128},
-        {1024, 256, 128},
-        {256, 256, 256},
-        {512, 512, 512},
-        {1024, 1024, 1024},
-        {2048, 2048, 2048},
-        {4096, 4096, 4096},
-        {8192, 8192, 8192},
-        // llama3 8b shapes
-        {4096, 14336 * 2, 4096}, // upgate
-        {4096, 4096, 14336},     // downproj
-        {128, 14336 * 2, 4096},  // upgate
-        {128, 4096, 14336}       // downproj
-    };
+   
     for (auto &&[M, N, K] : test_cases)
     {
         printf("\n=== Testing M=%d N=%d K=%d ===\n", M, N, K);
@@ -321,21 +319,6 @@ int bench_with_autotune()
 
     AutotuneCache cache;
     cache.load("autotune_cache.txt"); // load existing (ok if missing)
-
-    std::vector<std::tuple<int, int, int>> test_cases = {
-        {128, 128, 128},
-        {1024, 128, 128},
-        {1024, 256, 128},
-        {256, 256, 256},
-        {512, 512, 512},
-        {1024, 1024, 1024},
-        {2048, 2048, 2048},
-        {4096, 4096, 4096},
-        {8192, 8192, 8192},
-        {4096, 14336 * 2, 4096},
-        {4096, 4096, 14336},
-        {128, 14336 * 2, 4096},
-        {128, 4096, 14336}};
 
     // Query device max smem for runtime filtering
     int device;
