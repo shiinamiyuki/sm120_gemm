@@ -1,5 +1,7 @@
 #include "bf16_gemm.cuh"
+#include "gemm_config.h"
 #include <cublas_v2.h>
+#include <chrono>
 #define CHECK_CUBLAS(call)                                                                   \
     {                                                                                        \
         cublasStatus_t err = call;                                                           \
@@ -70,7 +72,8 @@ __global__ void naive_gemm_f32_kernel(int M, int N, int K,
 {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= M || col >= N) return;
+    if (row >= M || col >= N)
+        return;
     float acc = 0.0f;
     for (int k = 0; k < K; k++)
     {
@@ -125,17 +128,23 @@ std::pair<float, float> compare_result(const bf16 *Y, const bf16 *Y_ref, size_t 
     return {max_abs_error, max_rel_error};
 }
 
-bool check_result(const char *label, const bf16 *Y, const bf16 *Y_ref, const float *Y_f32_ref, int size, float tol)
+bool check_result(const char *label, const bf16 *Y, const bf16 *Y_ref, const float *Y_f32_ref, int size, float tol, bool verbose = true)
 {
     auto [abs_err, rel_err] = compare_result(Y, Y_ref, size);
     auto [abs_err_f32, rel_err_f32] = compare_result_f32(Y, Y_f32_ref, size);
     auto [cublas_abs, cublas_rel] = compare_result_f32(Y_ref, Y_f32_ref, size);
-    printf("[%s] vs cuBLAS:    abs=%f rel=%f\n", label, abs_err, rel_err);
-    printf("[%s] vs fp32 ref:  abs=%f rel=%f\n", label, abs_err_f32, rel_err_f32);
-    printf("[%s] cuBLAS vs ref: abs=%f rel=%f\n", label, cublas_abs, cublas_rel);
+    if (verbose)
+    {
+        printf("[%s] vs cuBLAS:    abs=%f rel=%f\n", label, abs_err, rel_err);
+        printf("[%s] vs fp32 ref:  abs=%f rel=%f\n", label, abs_err_f32, rel_err_f32);
+        printf("[%s] cuBLAS vs ref: abs=%f rel=%f\n", label, cublas_abs, cublas_rel);
+    }
     if (rel_err_f32 < tol)
     {
-        printf("[%s] PASSED\n", label);
+        if (verbose)
+        {
+            printf("[%s] PASSED\n", label);
+        }
         return true;
     }
     printf("[%s] FAILED\n", label);
@@ -153,7 +162,7 @@ bool check_result(const char *label, const bf16 *Y, const bf16 *Y_ref, const flo
     return false;
 }
 
-int main()
+int bench_debug()
 {
     cudaStream_t stream{};
     CHECK_CUDA(cudaStreamCreate(&stream));
@@ -291,4 +300,315 @@ int main()
         }
     }
     return 0;
+}
+
+int bench_with_autotune()
+{
+    cudaStream_t stream{};
+    CHECK_CUDA(cudaStreamCreate(&stream));
+    cublasHandle_t handle{};
+    CHECK_CUBLAS(cublasCreate(&handle));
+    CHECK_CUBLAS(cublasSetStream(handle, stream));
+
+    // Load kernel shared libraries
+    KernelRegistry registry;
+    if (!registry.load_dir(KERNEL_DIR))
+    {
+        fprintf(stderr, "No kernels found in %s\n", KERNEL_DIR);
+        return 1;
+    }
+
+    AutotuneCache cache;
+    cache.load("autotune_cache.txt"); // load existing (ok if missing)
+
+    std::vector<std::tuple<int, int, int>> test_cases = {
+        {128, 128, 128},
+        {1024, 128, 128},
+        {1024, 256, 128},
+        {256, 256, 256},
+        {512, 512, 512},
+        {1024, 1024, 1024},
+        {2048, 2048, 2048},
+        {4096, 4096, 4096},
+        {8192, 8192, 8192},
+        {4096, 14336 * 2, 4096},
+        {4096, 4096, 14336},
+        {128, 14336 * 2, 4096},
+        {128, 4096, 14336}};
+
+    // Query device max smem for runtime filtering
+    int device;
+    CHECK_CUDA(cudaGetDevice(&device));
+    int max_smem_optin;
+    CHECK_CUDA(cudaDeviceGetAttribute(&max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    printf("Device max dynamic smem: %d bytes (%.1f KB)\n", max_smem_optin, max_smem_optin / 1024.0);
+
+    auto cache_last_save_time = std::chrono::steady_clock::now();
+    for (auto &&[M, N, K] : test_cases)
+    {
+        printf("\n=== Autotune M=%d N=%d K=%d ===\n", M, N, K);
+
+        // Skip if already cached
+        if (cache.lookup(M, N, K))
+        {
+            auto e = *cache.lookup(M, N, K);
+            printf("  cached: %s  %.4f ms\n", e.config.name().c_str(), e.time_ms);
+            continue;
+        }
+
+        auto valid = registry.get_valid(M, N, K, max_smem_optin);
+        printf("  %zu valid configs\n", valid.size());
+        if (valid.empty())
+        {
+            printf("  SKIP (no valid configs)\n");
+            continue;
+        }
+
+        // Allocate data
+        std::vector<bf16> h_X(M * K), h_W(K * N), h_Y(M * N), h_Y_ref(M * N);
+        srand(42);
+        rand_bf16(h_X.data(), M * K);
+        rand_bf16(h_W.data(), K * N);
+
+        CUDABuffer<bf16> d_X(M * K), d_W(K * N), d_Y(M * N), d_Y_ref(M * N);
+        d_X.copy_from_host(h_X.data());
+        d_W.copy_from_host(h_W.data());
+
+        // cuBLAS reference
+        CHECK_CUDA(cudaMemsetAsync(d_Y_ref.data, 0, M * N * sizeof(bf16), stream));
+        cublas_gemm(handle, M, N, K, d_X.data, d_W.data, d_Y_ref.data);
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        d_Y_ref.copy_to_host(h_Y_ref.data(), stream);
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+
+        // Naive fp32 reference
+        CUDABuffer<float> d_Y_f32(M * N);
+        naive_gemm_f32(M, N, K, d_X.data, d_W.data, d_Y_f32.data, stream);
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        std::vector<float> h_Y_f32(M * N);
+        CHECK_CUDA(cudaMemcpyAsync(h_Y_f32.data(), d_Y_f32.data, M * N * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+
+        // Workspace: 4 * M * N floats (supports up to SPLIT_K=4)
+        size_t ws_size = 4 * (size_t)M * N;
+        CUDABuffer<float> d_workspace(ws_size);
+
+        // L2 cache flush buffers
+        int l2_bytes;
+        CHECK_CUDA(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, device));
+        size_t l2_size = static_cast<size_t>(l2_bytes);
+        size_t per_set_bytes = (size_t(M) * K + size_t(K) * N + size_t(M) * N) * sizeof(bf16);
+        int NUM_BUFS = std::max(1, (int)((2 * l2_size + per_set_bytes - 1) / per_set_bytes));
+
+        std::vector<CUDABuffer<bf16> *> bench_X, bench_W, bench_Y;
+        for (int b = 0; b < NUM_BUFS; b++)
+        {
+            bench_X.push_back(new CUDABuffer<bf16>(M * K));
+            bench_W.push_back(new CUDABuffer<bf16>(K * N));
+            bench_Y.push_back(new CUDABuffer<bf16>(M * N));
+            bench_X.back()->copy_from_host(h_X.data(), stream);
+            bench_W.back()->copy_from_host(h_W.data(), stream);
+        }
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+
+        // cuBLAS baseline time
+        int buf_idx = 0;
+        double cublas_ms = bench_ms([&]()
+                                    {
+            int b = buf_idx++ % NUM_BUFS;
+            cublas_gemm(handle, M, N, K, bench_X[b]->data, bench_W[b]->data, bench_Y[b]->data); }, stream);
+        double flops = 2.0 * M * N * K;
+        auto cublas_flops = flops / (cublas_ms * 1e-3) / 1e12;
+        printf("  cuBLAS: %.4f ms  %.4f TFLOPS\n", cublas_ms, flops / (cublas_ms * 1e-3) / 1e12);
+
+        const LoadedKernel *best = nullptr;
+        double best_ms = 1e30;
+
+        for (auto *kern : valid)
+        {
+            // Correctness check
+            CHECK_CUDA(cudaMemsetAsync(d_Y.data, 0, M * N * sizeof(bf16), stream));
+            dispatch(*kern, M, N, K, d_X.data, d_W.data, d_Y.data, d_workspace.data, stream);
+            cudaError_t err = cudaStreamSynchronize(stream);
+            if (err != cudaSuccess)
+            {
+                printf("  %-50s LAUNCH FAIL (%s)\n", kern->config.name().c_str(), cudaGetErrorString(err));
+                cudaGetLastError(); // clear error
+                continue;
+            }
+
+            d_Y.copy_to_host(h_Y.data(), stream);
+            CHECK_CUDA(cudaStreamSynchronize(stream));
+
+            float tol = 0.1f;
+            if (!check_result(kern->config.name().c_str(), h_Y.data(), h_Y_ref.data(), h_Y_f32.data(), M * N, tol, false))
+                continue;
+            // Benchmark
+            double ms = bench_ms([&]()
+                                 {
+                int b = buf_idx++ % NUM_BUFS;
+                dispatch(*kern, M, N, K, bench_X[b]->data, bench_W[b]->data, bench_Y[b]->data, d_workspace.data, stream); }, stream);
+
+            double tflops = flops / (ms * 1e-3) / 1e12;
+            double pct = 100.0 * tflops / (flops / (cublas_ms * 1e-3) / 1e12);
+            printf("  %-50s %.4f ms  %.4f TFLOPS  (%.1f%%)\n",
+                   kern->config.name().c_str(), ms, tflops, pct);
+
+            if (ms < best_ms)
+            {
+                best_ms = ms;
+                best = kern;
+            }
+        }
+
+        if (best)
+        {
+            double tflops = flops / (best_ms * 1e-3) / 1e12;
+            printf("  BEST: %s  %.4f ms  %.4f TFLOPS (%.1f%% of cuBLAS)\n",
+                   best->config.name().c_str(), best_ms, tflops, 100.0 * tflops / cublas_flops);
+            cache.store(M, N, K, best->config, best_ms);
+        }
+        else
+        {
+            printf("  NO VALID CONFIG\n");
+        }
+
+        for (int b = 0; b < NUM_BUFS; b++)
+        {
+            delete bench_X[b];
+            delete bench_W[b];
+            delete bench_Y[b];
+        }
+        auto since_last_save = std::chrono::steady_clock::now() - cache_last_save_time;
+        if (since_last_save > std::chrono::seconds(30))
+        {
+            cache.save("autotune_cache.txt");
+            cache_last_save_time = std::chrono::steady_clock::now();
+        }
+    }
+
+    cache.save("autotune_cache.txt");
+    printf("\nAutotune complete.\n");
+    return 0;
+}
+
+int quick_bench()
+{
+    AutotuneCache cache;
+    if (!cache.load("autotune_cache.txt"))
+    {
+        printf("No autotune cache found. Run with --autotune first.\n");
+        return 1;
+    }
+
+    KernelRegistry registry;
+    if (!registry.load_dir(KERNEL_DIR))
+    {
+        fprintf(stderr, "No kernels found in %s\n", KERNEL_DIR);
+        return 1;
+    }
+
+    cudaStream_t stream{};
+    CHECK_CUDA(cudaStreamCreate(&stream));
+    cublasHandle_t handle{};
+    CHECK_CUBLAS(cublasCreate(&handle));
+    CHECK_CUBLAS(cublasSetStream(handle, stream));
+
+    for (auto &[key, entry] : cache.entries)
+    {
+        auto &[M, N, K] = key;
+        printf("\n=== M=%d N=%d K=%d  config=%s ===\n", M, N, K, entry.config.name().c_str());
+
+        // Find the loaded kernel matching this config
+        const LoadedKernel *kern = nullptr;
+        for (auto &k : registry.kernels)
+        {
+            if (k.config.name() == entry.config.name())
+            {
+                kern = &k;
+                break;
+            }
+        }
+        if (!kern)
+        {
+            printf("  kernel .so not found, skipping\n");
+            continue;
+        }
+
+        std::vector<bf16> h_X(M * K), h_W(K * N);
+        srand(42);
+        rand_bf16(h_X.data(), M * K);
+        rand_bf16(h_W.data(), K * N);
+
+        CUDABuffer<bf16> d_X(M * K), d_W(K * N), d_Y(M * N);
+        d_X.copy_from_host(h_X.data());
+        d_W.copy_from_host(h_W.data());
+
+        size_t ws_size = 4 * (size_t)M * N;
+        CUDABuffer<float> d_workspace(ws_size);
+
+        // L2 flush buffers
+        int device;
+        CHECK_CUDA(cudaGetDevice(&device));
+        int l2_bytes;
+        CHECK_CUDA(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, device));
+        size_t l2_size = static_cast<size_t>(l2_bytes);
+        size_t per_set_bytes = (size_t(M) * K + size_t(K) * N + size_t(M) * N) * sizeof(bf16);
+        int NUM_BUFS = std::max(1, (int)((2 * l2_size + per_set_bytes - 1) / per_set_bytes));
+
+        std::vector<CUDABuffer<bf16> *> bench_X, bench_W, bench_Y;
+        for (int b = 0; b < NUM_BUFS; b++)
+        {
+            bench_X.push_back(new CUDABuffer<bf16>(M * K));
+            bench_W.push_back(new CUDABuffer<bf16>(K * N));
+            bench_Y.push_back(new CUDABuffer<bf16>(M * N));
+            bench_X.back()->copy_from_host(h_X.data(), stream);
+            bench_W.back()->copy_from_host(h_W.data(), stream);
+        }
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+
+        int buf_idx = 0;
+        double cublas_ms = bench_ms([&]()
+                                    {
+            int b = buf_idx++ % NUM_BUFS;
+            cublas_gemm(handle, M, N, K, bench_X[b]->data, bench_W[b]->data, bench_Y[b]->data); }, stream);
+
+        buf_idx = 0;
+        double kern_ms = bench_ms([&]()
+                                  {
+            int b = buf_idx++ % NUM_BUFS;
+            dispatch(*kern, M, N, K, bench_X[b]->data, bench_W[b]->data, bench_Y[b]->data, d_workspace.data, stream); }, stream);
+
+        double flops = 2.0 * M * N * K;
+        double cublas_tflops = flops / (cublas_ms * 1e-3) / 1e12;
+        double kern_tflops = flops / (kern_ms * 1e-3) / 1e12;
+        printf("  cuBLAS:  %.4f ms  %.4f TFLOPS\n", cublas_ms, cublas_tflops);
+        printf("  Ours:    %.4f ms  %.4f TFLOPS  (%.1f%% of cuBLAS)\n",
+               kern_ms, kern_tflops, 100.0 * kern_tflops / cublas_tflops);
+
+        for (int b = 0; b < NUM_BUFS; b++)
+        {
+            delete bench_X[b];
+            delete bench_W[b];
+            delete bench_Y[b];
+        }
+    }
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    // usage: bench [--debug | --autotune]
+    if (argc > 1 && strcmp(argv[1], "--debug") == 0)
+    {
+        return bench_debug();
+    }
+    else if (argc > 1 && strcmp(argv[1], "--autotune") == 0)
+    {
+        return bench_with_autotune();
+    }
+    else
+    {
+        return quick_bench();
+    }
 }

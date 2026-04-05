@@ -1,1 +1,1 @@
-# A Zero-dependency GEMM library for RTX 5090 (SM120). 100% CUBLAS performance.
+# A Zero-dependency GEMM library for RTX 50 series (SM120). 100% CUBLAS performance.

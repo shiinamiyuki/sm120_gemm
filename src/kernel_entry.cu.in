@@ -1,0 +1,27 @@
+// Auto-generated kernel entry point — do not edit directly.
+// This file is configured by CMake from kernel_entry.cu.in.
+#include "bf16_gemm.cuh"
+
+static constexpr int BM = @BM@;
+static constexpr int BN = @BN@;
+static constexpr int BK = @BK@;
+static constexpr int NUM_STAGES = @NUM_STAGES@;
+static constexpr int CWG = @CWG@;
+static constexpr int WARP_M = @WARP_M@;
+static constexpr int WARP_N = @WARP_N@;
+static constexpr int SPLIT_K = @SPLIT_K@;
+
+extern "C" void gemm_run(int M, int N, int K,
+                          const void *X, const void *W, void *Y,
+                          float *workspace, cudaStream_t stream) {
+    auto *x = static_cast<const bf16 *>(X);
+    auto *w = static_cast<const bf16 *>(W);
+    auto *y = static_cast<bf16 *>(Y);
+    if constexpr (SPLIT_K == 1) {
+        BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N>::run(
+            M, N, K, x, w, y, stream);
+    } else {
+        BF16GemmMMASplitK<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, SPLIT_K>::run(
+            M, N, K, x, w, y, workspace, stream);
+    }
+}
