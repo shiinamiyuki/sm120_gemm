@@ -15,6 +15,14 @@ __device__ __forceinline__ uint32_t bf16x2_as_u32(bf16 lo, bf16 hi)
     return r;
 }
 
+__device__ __forceinline__ uint32_t f32x2_to_bf16x2(float a, float b)
+{
+    bf16_2 v = __floats2bfloat162_rn(a, b);
+    uint32_t r;
+    memcpy(&r, &v, 4);
+    return r;
+}
+
 // ── TMA descriptor helper ──────────────────────────────────────────────
 // Wraps a CUtensorMap that lives on the host and is passed by-value to the kernel.
 // The descriptor is 128 bytes; we store it in a uint64_t[16] so it can be trivially
@@ -286,9 +294,6 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
     __syncthreads();
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
-    const int groupID = lane_id >> 2;
-    const int threadID_in_group = lane_id & 3;
-
     // ── Producer warp group (wg_id == 0) ───────────────────────────
     if (wg_id == 0)
     {
@@ -370,44 +375,38 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
                 {
                     const int k_base = ki * 16;
 
+                    // Preload all B fragments for this k-step via ldmatrix
+                    uint32_t b_frag[P::MMA_N][2];
+                    for (int ni = 0; ni < P::MMA_N; ni++)
+                    {
+                        const int n_base = n_warp_base + ni * 8;
+                        int b_n = n_base + (lane_id & 7);
+                        int b_k = k_base + (((lane_id >> 3) & 1) * 8);
+                        uint32_t b_addr = smem_u32(&sW[swizzle_smem_offset<P::SWIZZLE_BYTES>(b_n, b_k, BK)]);
+                        asm volatile(
+                            "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                            : "=r"(b_frag[ni][0]), "=r"(b_frag[ni][1])
+                            : "r"(b_addr));
+                    }
+
                     for (int mi = 0; mi < P::MMA_M; mi++)
                     {
                         const int m_base = m_warp_base + mi * 16;
 
+                        // Load A fragment via ldmatrix (only depends on mi, ki)
+                        uint32_t a[4];
+                        {
+                            int a_row = m_base + (lane_id & 7) + ((lane_id >> 3) & 1) * 8;
+                            int a_col = k_base + (lane_id >> 4) * 8;
+                            uint32_t a_addr = smem_u32(&sX[swizzle_smem_offset<P::SWIZZLE_BYTES>(a_row, a_col, BK)]);
+                            asm volatile(
+                                "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                                : "r"(a_addr));
+                        }
+
                         for (int ni = 0; ni < P::MMA_N; ni++)
                         {
-                            const int n_base = n_warp_base + ni * 8;
-
-                            uint32_t a[4];
-                            {
-                                int r0 = m_base + groupID;
-                                int c0 = k_base + threadID_in_group * 2;
-                                int i0 = swizzle_smem_offset<P::SWIZZLE_BYTES>(r0, c0, BK);
-                                a[0] = bf16x2_as_u32(sX[i0], sX[i0 + 1]);
-
-                                int r1 = m_base + groupID + 8;
-                                int i1 = swizzle_smem_offset<P::SWIZZLE_BYTES>(r1, c0, BK);
-                                a[1] = bf16x2_as_u32(sX[i1], sX[i1 + 1]);
-
-                                int c1 = k_base + threadID_in_group * 2 + 8;
-                                int i2 = swizzle_smem_offset<P::SWIZZLE_BYTES>(r0, c1, BK);
-                                a[2] = bf16x2_as_u32(sX[i2], sX[i2 + 1]);
-                                int i3 = swizzle_smem_offset<P::SWIZZLE_BYTES>(r1, c1, BK);
-                                a[3] = bf16x2_as_u32(sX[i3], sX[i3 + 1]);
-                            }
-
-                            uint32_t b[2];
-                            {
-                                int bk0 = k_base + threadID_in_group * 2;
-                                int bn0 = n_base + groupID;
-                                int j0 = swizzle_smem_offset<P::SWIZZLE_BYTES>(bn0, bk0, BK);
-                                b[0] = bf16x2_as_u32(sW[j0], sW[j0 + 1]);
-
-                                int bk1 = k_base + threadID_in_group * 2 + 8;
-                                int j1 = swizzle_smem_offset<P::SWIZZLE_BYTES>(bn0, bk1, BK);
-                                b[1] = bf16x2_as_u32(sW[j1], sW[j1 + 1]);
-                            }
-
                             asm volatile(
                                 "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                                 "{%0, %1, %2, %3}, "
@@ -417,7 +416,7 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
                                 : "+f"(acc[mi][ni][0]), "+f"(acc[mi][ni][1]),
                                   "+f"(acc[mi][ni][2]), "+f"(acc[mi][ni][3])
                                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-                                  "r"(b[0]), "r"(b[1]),
+                                  "r"(b_frag[ni][0]), "r"(b_frag[ni][1]),
                                   "f"(acc[mi][ni][0]), "f"(acc[mi][ni][1]),
                                   "f"(acc[mi][ni][2]), "f"(acc[mi][ni][3]));
                         }
@@ -458,13 +457,13 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
                     int m_base = m_warp_base + mi * 16;
                     int n_base = n_warp_base + ni * 8;
 
-                    int sm0 = m_base + groupID;
-                    int sn0 = n_base + threadID_in_group * 2;
-                    sY[sm0 * BN + sn0]     = bf16(acc[mi][ni][0]);
-                    sY[sm0 * BN + sn0 + 1] = bf16(acc[mi][ni][1]);
-                    int sm1 = m_base + groupID + 8;
-                    sY[sm1 * BN + sn0]     = bf16(acc[mi][ni][2]);
-                    sY[sm1 * BN + sn0 + 1] = bf16(acc[mi][ni][3]);
+                    uint32_t c0 = f32x2_to_bf16x2(acc[mi][ni][0], acc[mi][ni][1]);
+                    uint32_t c1 = f32x2_to_bf16x2(acc[mi][ni][2], acc[mi][ni][3]);
+                    int st_row = m_base + (lane_id & 7) + ((lane_id >> 3) & 1) * 8;
+                    uint32_t st_addr = smem_u32(&sY[st_row * BN + n_base]);
+                    asm volatile(
+                        "stmatrix.sync.aligned.m8n8.x2.shared.b16 [%0], {%1, %2};\n"
+                        :: "r"(st_addr), "r"(c0), "r"(c1));
                 }
             }
 
@@ -737,44 +736,38 @@ __global__ void __launch_bounds__(BF16GemmMMASplitK<BM, BN, BK, NUM_STAGES, CWG,
                 {
                     const int k_base = ki * 16;
 
+                    // Preload all B fragments for this k-step via ldmatrix
+                    uint32_t b_frag[P::MMA_N][2];
+                    for (int ni = 0; ni < P::MMA_N; ni++)
+                    {
+                        const int n_base = n_warp_base + ni * 8;
+                        int b_n = n_base + (lane_id & 7);
+                        int b_k = k_base + (((lane_id >> 3) & 1) * 8);
+                        uint32_t b_addr = smem_u32(&sW[swizzle_smem_offset<P::SWIZZLE_BYTES>(b_n, b_k, BK)]);
+                        asm volatile(
+                            "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                            : "=r"(b_frag[ni][0]), "=r"(b_frag[ni][1])
+                            : "r"(b_addr));
+                    }
+
                     for (int mi = 0; mi < P::MMA_M; mi++)
                     {
                         const int m_base = m_warp_base + mi * 16;
 
+                        // Load A fragment via ldmatrix (only depends on mi, ki)
+                        uint32_t a[4];
+                        {
+                            int a_row = m_base + (lane_id & 7) + ((lane_id >> 3) & 1) * 8;
+                            int a_col = k_base + (lane_id >> 4) * 8;
+                            uint32_t a_addr = smem_u32(&sX[swizzle_smem_offset<P::SWIZZLE_BYTES>(a_row, a_col, BK)]);
+                            asm volatile(
+                                "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                                : "r"(a_addr));
+                        }
+
                         for (int ni = 0; ni < P::MMA_N; ni++)
                         {
-                            const int n_base = n_warp_base + ni * 8;
-
-                            uint32_t a[4];
-                            {
-                                int r0 = m_base + groupID;
-                                int c0 = k_base + threadID_in_group * 2;
-                                int i0 = swizzle_smem_offset<P::SWIZZLE_BYTES>(r0, c0, BK);
-                                a[0] = bf16x2_as_u32(sX[i0], sX[i0 + 1]);
-
-                                int r1 = m_base + groupID + 8;
-                                int i1 = swizzle_smem_offset<P::SWIZZLE_BYTES>(r1, c0, BK);
-                                a[1] = bf16x2_as_u32(sX[i1], sX[i1 + 1]);
-
-                                int c1 = k_base + threadID_in_group * 2 + 8;
-                                int i2 = swizzle_smem_offset<P::SWIZZLE_BYTES>(r0, c1, BK);
-                                a[2] = bf16x2_as_u32(sX[i2], sX[i2 + 1]);
-                                int i3 = swizzle_smem_offset<P::SWIZZLE_BYTES>(r1, c1, BK);
-                                a[3] = bf16x2_as_u32(sX[i3], sX[i3 + 1]);
-                            }
-
-                            uint32_t b[2];
-                            {
-                                int bk0 = k_base + threadID_in_group * 2;
-                                int bn0 = n_base + groupID;
-                                int j0 = swizzle_smem_offset<P::SWIZZLE_BYTES>(bn0, bk0, BK);
-                                b[0] = bf16x2_as_u32(sW[j0], sW[j0 + 1]);
-
-                                int bk1 = k_base + threadID_in_group * 2 + 8;
-                                int j1 = swizzle_smem_offset<P::SWIZZLE_BYTES>(bn0, bk1, BK);
-                                b[1] = bf16x2_as_u32(sW[j1], sW[j1 + 1]);
-                            }
-
                             asm volatile(
                                 "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                                 "{%0, %1, %2, %3}, "
@@ -784,7 +777,7 @@ __global__ void __launch_bounds__(BF16GemmMMASplitK<BM, BN, BK, NUM_STAGES, CWG,
                                 : "+f"(acc[mi][ni][0]), "+f"(acc[mi][ni][1]),
                                   "+f"(acc[mi][ni][2]), "+f"(acc[mi][ni][3])
                                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-                                  "r"(b[0]), "r"(b[1]),
+                                  "r"(b_frag[ni][0]), "r"(b_frag[ni][1]),
                                   "f"(acc[mi][ni][0]), "f"(acc[mi][ni][1]),
                                   "f"(acc[mi][ni][2]), "f"(acc[mi][ni][3]));
                         }
