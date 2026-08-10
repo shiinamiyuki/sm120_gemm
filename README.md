@@ -15,24 +15,25 @@ Computes $Y = X \cdot W^T$ where $X$ is $(M \times K)$ BF16, $W$ is $(N \times K
 - **Swizzled Tile Rasterization**: Output tiles are visited in a swizzled order (configurable `SWIZZLE_WIDTH`) to improve L2 cache locality.
 - **`ldmatrix` / `stmatrix`**: Warp-cooperative shared memory loads (`ldmatrix.sync.aligned.m8n8.x4`) and stores (`stmatrix.sync.aligned.m8n8.x2`) for efficient MMA fragment movement.
 - **L2-aware Benchmarking**: Buffer rotation flushes L2 between iterations for accurate throughput measurement.
+- **JIT Kernel Compilation**: Kernels are compiled on demand by invoking `nvcc` at runtime and cached on disk, so only the configurations actually used are ever built.
 - **Autotuning**: A lightweight autotuner sweeps the kernel configuration space (tile sizes, pipeline stages, warp grouping, split-K) for each problem size, caching results to avoid repeated tuning.
 
 ## Project Structure
 
 ```
 src/
-  bf16_gemm.cuh       # Core GEMM kernel: TMA, mbarrier pipeline,
+  bf16_gemm.cuh        # Core GEMM kernel: TMA, mbarrier pipeline,
                        # MMA loop, split-K, and launch logic
   common.h             # CUDA error checking, benchmarking utility
-  gemm_config.h        # Runtime config parsing, kernel registry (.so loader),
-                       # autotune cache, and dispatch
-  kernel_entry.cu.in   # CMake template — instantiates one BF16GemmMMA or
-                       # BF16GemmMMASplitK per configuration
-  bench.cu             # Benchmarking harness: correctness checks vs cuBLAS
-                       # and FP32 reference, autotuning, quick bench
-scripts/
-  gen_configs.py       # Generates all valid (BM, BN, BK, stages, CWG,
-                       # WARP_M, WARP_N, SPLIT_K) configs as a CMake include
+  gemm_config.h        # Config parsing/validation, config-space enumeration,
+                       # autotune cache
+  kernel_jit.h         # On-the-fly nvcc compilation, content-hashed .so cache,
+                       # dlopen of compiled kernels
+  kernel_entry.cu      # JIT translation unit — instantiates one BF16GemmMMA or
+                       # BF16GemmMMASplitK from -D defines
+  bench_harness.h      # CUDA buffers, cuBLAS + FP32 references, correctness
+                       # checking, L2-flushing timing
+  bench.cu             # Command line and the bench/autotune modes
 ```
 
 ## Requirements
@@ -40,106 +41,120 @@ scripts/
 - NVIDIA GPU with SM120 (RTX 5090 / RTX Blackwell)
 - CUDA Toolkit (12.8+ recommended, must support `sm_120a`)
 - CMake 3.18+
-- Python 3 (for config generation)
 
 ## Build
 
 ```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 ```
 
-This builds:
-- **135 kernel shared libraries** (`build/kernels/libgemm_*.so`), one per tile/warp configuration
-- **`bench`** executable for benchmarking and autotuning
+This builds a single `bench` executable in a few seconds. Kernels are **not** built here — `bench` compiles them on demand with `nvcc` and caches the resulting `.so` files under `build/jit_cache/`. The cache key includes a hash of the kernel sources, so editing `bf16_gemm.cuh` transparently invalidates every previously compiled kernel.
 
 ## Usage
 
-### Quick Bench (uses cached autotune results)
-
 ```bash
 cd build
-./bench
+
+./bench                              # bench every shape in the autotune cache
+./bench --autotune                   # autotune the built-in shape list
+./bench --shape M,N,K                # bench one shape with its cached config
+./bench --shape M,N,K --autotune     # autotune one shape
+./bench --shape M,N,K --config CFG   # compile, check and bench one config
+./bench --list-configs               # print the configuration space
 ```
 
-Runs each test case with the previously autotuned best kernel and compares against cuBLAS.
+`--shape` is repeatable. Benching a shape that is not in the cache exits with a hint to autotune it first:
 
-### Autotune
-
-```bash
-./bench --autotune
+```
+$ ./bench --shape 4096,4096,4096
+no cached config for M=4096 N=4096 K=4096
+hint: bench --shape 4096,4096,4096 --autotune
 ```
 
-Iterates all valid kernel configs for each problem size, checks correctness (vs cuBLAS and an FP32 reference), benchmarks each, and saves the best to `autotune_cache.txt`.
+Autotuning iterates every valid config for the shape, checks correctness (against cuBLAS and a naive FP32 reference), benchmarks each, and saves the winner to `autotune_cache.txt`.
 
-### Debug Mode
-
-```bash
-./bench --debug
-```
-
-Runs a fixed kernel config with detailed correctness output (max absolute/relative error vs cuBLAS and FP32 reference) for every test case.
+Other options: `--cache PATH`, `--jit-cache DIR`, `--jobs N` (parallel `nvcc` jobs), `--max-smem-kb N`, `--warmup N`, `--repeat N`, `--tol F`, `--no-check`, `--force`, `-v`. See `./bench --help`.
 
 ## Kernel Configuration Space
 
-Each kernel is parameterized by:
+A configuration is written as a single string, which is also the name used in the autotune cache and the JIT cache:
+
+```
+128x128x64_s3_cwg2_w32x32_sk1
+ |          |   |    |      |
+ |          |   |    |      +-- SPLIT_K
+ |          |   |    +--------- WARP_M x WARP_N
+ |          |   +-------------- consumer warp groups (4 warps each)
+ |          +------------------ NUM_STAGES
+ +----------------------------- BM x BN x BK
+```
+
+Tokens may be given in any order and omitted tokens take a default, so `--config` accepts partial specifications:
+
+```bash
+./bench --shape 4096,4096,4096 --config 128x64            # bk=64 s=3 cwg=2 sk=1, warp tile derived
+./bench --shape 4096,4096,4096 --config 128x64x64_sk2
+./bench --shape 4096,4096,4096 --config sk2_cwg1_128x64
+```
+
+Defaults are `BK=64`, `NUM_STAGES=3`, `CWG=2`, `SPLIT_K=1`. If the warp tile is omitted, the most square `WARP_M x WARP_N` that exactly covers `BM x BN` with `CWG * 4` warps is chosen.
 
 | Parameter | Values | Description |
 |-----------|--------|-------------|
 | `BM` | 64, 128 | Tile size along M |
 | `BN` | 64, 128 | Tile size along N |
 | `BK` | 64 | Tile size along K |
-| `NUM_STAGES` | 2, 3, 4 | Pipeline depth (bounded by 128 KB shared memory) |
+| `NUM_STAGES` | 2, 3, 4 | Pipeline depth (bounded by shared memory) |
 | `CWG` | 1, 2 | Consumer warp groups (4 warps each) |
 | `WARP_M` | 16–128 | Per-warp tile along M (multiples of 16) |
 | `WARP_N` | 8–128 | Per-warp tile along N (multiples of 8) |
 | `SPLIT_K` | 1, 2 | K-dimension parallelism factor |
 
-Constraint: `(BM / WARP_M) * (BN / WARP_N) == CWG * 4` (total consumer warps must tile the output block exactly).
+Constraint: `(BM / WARP_M) * (BN / WARP_N) == CWG * 4` (total consumer warps must tile the output block exactly). The sweep enumerates 135 configurations within a 128 KB shared-memory budget; on a device with a 99 KB per-block limit, 122 of them are runnable.
 
 ## Results (RTX 5090)
 
 ```
-=== M=128 N=4096 K=14336  config=bm64_bn64_bk64_s4_cwg2_wm32_wn16_sk1 ===
-  cuBLAS:  0.1087 ms  138.3443 TFLOPS
-  Ours:    0.1073 ms  140.0707 TFLOPS  (101.2% of cuBLAS)
+=== M=128 N=4096 K=14336  config=64x64x64_s4_cwg2_w32x16_sk1 ===
+  cuBLAS    0.1082 ms  138.9397 TFLOPS
+  ours      0.1064 ms  141.2754 TFLOPS  (101.7% of cuBLAS)
 
-=== M=128 N=28672 K=4096  config=bm128_bn64_bk64_s3_cwg2_wm32_wn32_sk1 ===
-  cuBLAS:  0.1927 ms  156.0399 TFLOPS
-  Ours:    0.1935 ms  155.3831 TFLOPS  (99.6% of cuBLAS)
+=== M=128 N=28672 K=4096  config=128x64x64_s3_cwg2_w32x32_sk1 ===
+  cuBLAS    0.1906 ms  157.7666 TFLOPS
+  ours      0.1909 ms  157.5220 TFLOPS  (99.8% of cuBLAS)
 
-=== M=512 N=512 K=14336  config=bm64_bn64_bk64_s4_cwg2_wm16_wn32_sk2 ===
-  cuBLAS:  0.0482 ms  156.0516 TFLOPS
-  Ours:    0.0549 ms  136.9449 TFLOPS  (87.8% of cuBLAS)
+=== M=512 N=512 K=14336  config=64x64x64_s4_cwg2_w16x32_sk2 ===
+  cuBLAS    0.0462 ms  162.7333 TFLOPS
+  ours      0.0534 ms  140.6263 TFLOPS  (86.4% of cuBLAS)
 
-=== M=1024 N=1024 K=1024  config=bm64_bn128_bk64_s3_cwg2_wm16_wn64_sk1 ===
-  cuBLAS:  0.0186 ms  115.6651 TFLOPS
-  Ours:    0.0185 ms  115.9749 TFLOPS  (100.3% of cuBLAS)
+=== M=1024 N=1024 K=1024  config=64x128x64_s3_cwg2_w16x64_sk1 ===
+  cuBLAS    0.0186 ms  115.3965 TFLOPS
+  ours      0.0188 ms  114.3544 TFLOPS  (99.1% of cuBLAS)
 
-=== M=1024 N=1024 K=14336  config=bm128_bn64_bk64_s2_cwg2_wm32_wn32_sk1 ===
-  cuBLAS:  0.1808 ms  166.2683 TFLOPS
-  Ours:    0.1947 ms  154.4279 TFLOPS  (92.9% of cuBLAS)
+=== M=1024 N=1024 K=14336  config=128x64x64_s2_cwg2_w32x32_sk1 ===
+  cuBLAS    0.1797 ms  167.3434 TFLOPS
+  ours      0.1939 ms  155.0498 TFLOPS  (92.7% of cuBLAS)
 
-=== M=2048 N=2048 K=2048  config=bm64_bn64_bk64_s4_cwg2_wm16_wn32_sk1 ===
-  cuBLAS:  0.1131 ms  151.9224 TFLOPS
-  Ours:    0.1101 ms  156.0240 TFLOPS  (102.7% of cuBLAS)
+=== M=2048 N=2048 K=2048  config=64x64x64_s4_cwg2_w16x32_sk1 ===
+  cuBLAS    0.1127 ms  152.4357 TFLOPS
+  ours      0.1082 ms  158.8000 TFLOPS  (104.2% of cuBLAS)
 
-=== M=4096 N=4096 K=4096  config=bm128_bn64_bk64_s3_cwg2_wm32_wn32_sk1 ===
-  cuBLAS:  0.7043 ms  195.1504 TFLOPS
-  Ours:    0.6961 ms  197.4462 TFLOPS  (101.2% of cuBLAS)
+=== M=4096 N=4096 K=4096  config=128x64x64_s3_cwg2_w32x32_sk1 ===
+  cuBLAS    0.7027 ms  195.5783 TFLOPS
+  ours      0.6917 ms  198.6907 TFLOPS  (101.6% of cuBLAS)
 
-=== M=4096 N=4096 K=14336  config=bm64_bn128_bk64_s2_cwg2_wm64_wn16_sk1 ===
-  cuBLAS:  2.3613 ms  203.7162 TFLOPS
-  Ours:    2.3593 ms  203.8907 TFLOPS  (100.1% of cuBLAS)
+=== M=4096 N=4096 K=14336  config=64x128x64_s2_cwg2_w64x16_sk1 ===
+  cuBLAS    2.3678 ms  203.1534 TFLOPS
+  ours      2.3718 ms  202.8156 TFLOPS  (99.8% of cuBLAS)
 
-=== M=4096 N=28672 K=4096  config=bm128_bn64_bk64_s3_cwg2_wm16_wn64_sk1 ===
-  cuBLAS:  4.4774 ms  214.8751 TFLOPS
-  Ours:    4.4283 ms  217.2546 TFLOPS  (101.1% of cuBLAS)
+=== M=4096 N=28672 K=4096  config=128x64x64_s3_cwg2_w16x64_sk1 ===
+  cuBLAS    4.4580 ms  215.8105 TFLOPS
+  ours      4.4231 ms  217.5125 TFLOPS  (100.8% of cuBLAS)
 
-=== M=8192 N=8192 K=8192  config=bm64_bn128_bk64_s2_cwg2_wm32_wn32_sk1 ===
-  cuBLAS:  5.1118 ms  215.0943 TFLOPS
-  Ours:    5.0508 ms  217.6914 TFLOPS  (101.2% of cuBLAS)
+=== M=8192 N=8192 K=8192  config=64x128x64_s2_cwg2_w32x32_sk1 ===
+  cuBLAS    5.0894 ms  216.0408 TFLOPS
+  ours      5.0695 ms  216.8886 TFLOPS  (100.4% of cuBLAS)
 ```
 
 Test cases include both square matrices and **LLaMA 3 8B** shapes (upgate projection 4096×28672×4096, downproj 4096×4096×14336, and their batch-128 variants).

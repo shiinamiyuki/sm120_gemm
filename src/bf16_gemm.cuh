@@ -716,6 +716,7 @@ __global__ void __launch_bounds__(BF16GemmMMASplitK<BM, BN, BK, NUM_STAGES, CWG,
             float acc[P::MMA_M][P::MMA_N][4]{};
             for (int k = k_start; k < k_end; k++)
             {
+                __syncwarp();
                 mbarrier_wait(smem_u32(&smem.full_barrier[stage]), phase);
 
                 const bf16 *sX = smem.X[stage];
@@ -772,12 +773,12 @@ __global__ void __launch_bounds__(BF16GemmMMASplitK<BM, BN, BK, NUM_STAGES, CWG,
                         }
                     }
                 }
-
+                __syncwarp();
                 if (lane_id == 0)
                 {
                     mbarrier_arrive(smem_u32(&smem.empty_barrier[stage]));
                 }
-
+                __syncwarp();
                 stage++;
                 if (stage == NUM_STAGES)
                 {
@@ -787,7 +788,7 @@ __global__ void __launch_bounds__(BF16GemmMMASplitK<BM, BN, BK, NUM_STAGES, CWG,
             }
             // mysterious sync..
             // otherwise it triggers a mysterious bug in split k
-            asm volatile("bar.sync %0, %1;" :: "r"(P::TOTAL_WGS), "r"(CWG * P::THREADS_PER_WG) : "memory");
+            // asm volatile("bar.sync %0, %1;" :: "r"(P::TOTAL_WGS), "r"(CWG * P::THREADS_PER_WG) : "memory");
             // ── Store f32 partial results directly to global workspace ──
             {
                 float *ws = workspace + (size_t)split_idx * M * N;
