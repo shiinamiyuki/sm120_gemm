@@ -10,7 +10,7 @@ Computes $Y = X \cdot W^T$ where $X$ is $(M \times K)$ BF16, $W$ is $(N \times K
 - **Multi-stage Software Pipeline**: Configurable 2–4 stage pipeline with `mbarrier`-based synchronization between producer and consumer warp groups.
 - **Persistent Kernel**: Each kernel is launched with exactly #SM blocks and loops over tiles, avoiding repeated kernel launch overhead and reducing pipeline bubbles.
 - **Tensor Core via `mma.sync.aligned.m16n8k16`**: BF16→FP32 matrix-multiply-accumulate using `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`.
-- **Split-K**: For small-M problems, the K dimension is partitioned across multiple CTAs, with a separate reduction kernel to sum FP32 partial results.
+- **Split-K**: For small-M problems, the K dimension is partitioned across multiple CTAs, with a separate reduction kernel to sum FP32 partial results. Split-K is a compile-time parameter of the same kernel and changes only the epilogue: `SPLIT_K == 1` stages BF16 through shared memory and TMA-stores it, while `SPLIT_K > 1` writes FP32 partials straight to a workspace.
 - **128B Shared Memory Swizzling**: TMA descriptors use `CU_TENSOR_MAP_SWIZZLE_128B` and shared memory access uses matching swizzle indexing to eliminate bank conflicts.
 - **Swizzled Tile Rasterization**: Output tiles are visited in a swizzled order (configurable `SWIZZLE_WIDTH`) to improve L2 cache locality.
 - **`ldmatrix` / `stmatrix`**: Warp-cooperative shared memory loads (`ldmatrix.sync.aligned.m8n8.x4`) and stores (`stmatrix.sync.aligned.m8n8.x2`) for efficient MMA fragment movement.
@@ -29,8 +29,8 @@ src/
                        # autotune cache
   kernel_jit.h         # On-the-fly nvcc compilation, content-hashed .so cache,
                        # dlopen of compiled kernels
-  kernel_entry.cu      # JIT translation unit — instantiates one BF16GemmMMA or
-                       # BF16GemmMMASplitK from -D defines
+  kernel_entry.cu      # JIT translation unit — instantiates one BF16GemmMMA
+                       # from -D defines
   bench_harness.h      # CUDA buffers, cuBLAS + FP32 references, correctness
                        # checking, L2-flushing timing
   bench.cu             # Command line and the bench/autotune modes

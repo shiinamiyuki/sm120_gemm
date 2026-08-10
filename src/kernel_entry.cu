@@ -23,11 +23,6 @@ extern "C" void gemm_run(int M, int N, int K,
     auto *x = static_cast<const bf16 *>(X);
     auto *w = static_cast<const bf16 *>(W);
     auto *y = static_cast<bf16 *>(Y);
-    if constexpr (SPLIT_K == 1) {
-        BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N>::run(
-            M, N, K, x, w, y, stream);
-    } else {
-        BF16GemmMMASplitK<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, SPLIT_K>::run(
-            M, N, K, x, w, y, workspace, stream);
-    }
+    BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, SPLIT_K>::run(
+        M, N, K, x, w, y, workspace, stream);
 }
