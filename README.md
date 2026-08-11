@@ -38,6 +38,12 @@ src/
   bench.cu             # Command line and the bench/autotune modes
   proto_tinym.cu       # Standalone driver for the tiny-M kernel: synthetic
                        # correctness probes and a fixed variant sweep
+  fp8_gemm.cuh         # FP8 (e4m3) tensor-core kernel: bf16 kernel structure
+                       # with mma.m16n8k32.e4m3 and per-tensor scaling
+  fp8_cublaslt.h       # Per-tensor-scaled FP8 (e4m3) GEMM via cuBLASLt
+  fp8_harness.h        # FP8 quantization model, FP32 reference kernels,
+                       # accuracy metrics, Fp8Problem
+  bench_fp8.cu         # FP8 baseline driver
 ```
 
 ## Requirements
@@ -129,6 +135,97 @@ Both families are enumerated into the same search space, and `--autotune` picks 
 | `SPLIT_K` | 1, 2 | 1, 2, 4, 8, 16 | K-dimension parallelism factor |
 
 Constraint: `(BM / WARP_M) * (BN / WARP_N) == CWG * 4` (total consumer warps must tile the output block exactly). The tensor-core sweep enumerates 135 configurations within a 128 KB shared-memory budget; on a device with a 99 KB per-block limit, 122 of them are runnable, plus 50 tiny-M configurations (`BM` ∈ {4, 8}, `BN` ∈ {128, 256}, `SPLIT_K` up to 16).
+
+## FP8 (e4m3), per-tensor scaling
+
+A harness, an FP32 reference, the cuBLASLt baseline, and a first-pass
+hand-written kernel (`FP8GemmMMA`). The kernel is correct everywhere but not
+yet tuned — see the table below.
+
+```bash
+./bench_fp8                  # correctness + baseline + our kernel variants
+./bench_fp8 --quant-error    # also report what fp8 quantization costs
+./bench_fp8 --normal         # gaussian inputs (--outlier adds 1000x outliers)
+./bench_fp8 --probe-layout   # verify the m16n8k32 fragment layout, then exit
+```
+
+Quantization model, per tensor:
+
+```
+scale = amax(real) / 448        # 448 = largest finite e4m3
+code  = e4m3(real / scale)      # saturating, round-to-nearest-even
+real ~= scale * float(code)
+```
+
+so the GEMM over codes is scaled by `x_scale * w_scale` — the single product
+cuBLASLt applies through its A/B scale pointers, leaving `alpha = 1`. cuBLASLt
+requires FP8 matmuls in "TN" form, which the existing layout already satisfies:
+W is passed as A with `op = T` and X as B with `op = N`, exactly as the bf16
+path does.
+
+The reference is a naive FP32 GEMM **over the quantized codes**, so it is the
+exact value the FP8 GEMM should produce — this isolates GEMM error from
+quantization error. cuBLASLt matches it to **0.39%**, which is precisely bf16
+output rounding (2⁻⁸) and is constant across every shape and distribution.
+`--quant-error` separately reports quantization error against a full-precision
+reference.
+
+Two things worth knowing before designing a kernel:
+
+- **Per-tensor e4m3 is robust to dynamic range.** Output RMS-relative error is
+  3.61% for uniform inputs, 3.75% for gaussian, and only 3.81% with 0.1% of
+  elements scaled 1000×. e4m3 is a *floating point* format holding ~3 mantissa
+  bits across 2⁻⁶…448, so unlike per-tensor int8, raising amax costs nothing
+  until values fall through into subnormals. Per-block scaling has to be
+  motivated by something other than plain outliers.
+- **Accuracy is reported as RMS-relative**, `||got-ref||₂ / ||ref||₂`, not max
+  elementwise relative error. Inputs and outputs both contain values arbitrarily
+  close to zero, and a max-relative metric is entirely determined by those — it
+  reads ~1.0 however good the quantizer is.
+
+### The FP8 kernel
+
+`FP8GemmMMA` is the bf16 tensor-core kernel with the consumer swapped to
+`mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`. Everything else — the
+persistent CTAs, the producer warp group, the TMA/mbarrier pipeline, the warp
+tiling, the epilogue — is unchanged. Three consequences follow from that one
+swap:
+
+| | fp8 `m16n8k32` | bf16 `m16n8k16` |
+|---|---|---|
+| A fragment | 4 regs x **4 fp8** along k | 4 regs x 2 bf16 |
+| B fragment | 2 regs x **4 fp8** along k | 2 regs x 2 bf16 |
+| C/D fragment | 4 x fp32 — **identical** | 4 x fp32 |
+| k per instruction | **32** | 16 |
+
+- `MMA_K = BK / 32`, and `BK` is pinned to **128**: the 128B swizzle wants a
+  128-byte smem row and an fp8 element is one byte. A pipeline stage therefore
+  costs the same shared memory as the bf16 kernel's `BK=64` while covering
+  twice the k.
+- Fragment **addressing is unchanged in bytes**. A register holds 4 bytes
+  either way, so the same `ldmatrix.b16` loaders work on fp8 reinterpreted as
+  b16 pairs; only the per-lane k offsets count elements instead
+  (`(lane>>4)*16` fp8 where bf16 used `(lane>>4)*8`).
+- The accumulator layout is identical, so the epilogue only gains the
+  dequantization scale, applied to the fp32 accumulator before narrowing.
+
+The exact per-lane layout is documented at the top of `fp8_gemm.cuh` and is
+verified by `--probe-layout`, which runs a single MMA against a CPU dot
+product using small integers so both are exact.
+
+### cuBLASLt FP8 baseline (RTX 5090)
+
+| shape | TFLOPS | GB/s | vs bf16 cuBLAS |
+|---|---|---|---|
+| 1024³ | 204 | 399 | 1.8× |
+| 4096³ | 542 | 265 | 2.8× |
+| 8192³ | 579 | 141 | 2.7× |
+| 4096×28672×4096 (upgate) | 529 | 203 | 2.5× |
+| 4096×4096×14336 (downproj) | 520 | 163 | 2.6× |
+| 128×28672×4096 | 250 | 1043 | 1.6× |
+| 128×4096×14336 | 264 | 1082 | 1.9× |
+
+The M=128 rows are bandwidth-bound (~1.05 TB/s), not compute-bound.
 
 ## Results (RTX 5090)
 

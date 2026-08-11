@@ -70,11 +70,13 @@ __device__ __forceinline__ void tma_store_wait()
     asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
 }
 
-// Host-side: create a 2D TMA descriptor for a row-major or column-major bf16 matrix
+// Host-side: create a 2D TMA descriptor for a row-major or column-major matrix
 // globalDim0 = inner-most (contiguous) dimension, globalDim1 = outer dimension
 // boxDim0 / boxDim1 = tile sizes along each dimension
-static inline TMADescriptor create_tma_desc_2d(
-    const bf16 *gmem_ptr,
+// elem_bytes must match dtype; TMA itself only cares about the element size,
+// which is why fp8 tiles just pass UINT8.
+static inline TMADescriptor create_tma_desc_2d_raw(
+    const void *gmem_ptr, CUtensorMapDataType dtype, size_t elem_bytes,
     uint32_t globalDim0, uint32_t globalDim1,
     uint32_t boxDim0, uint32_t boxDim1,
     CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE)
@@ -83,13 +85,13 @@ static inline TMADescriptor create_tma_desc_2d(
     CUtensorMap *map = reinterpret_cast<CUtensorMap *>(&desc.raw);
 
     uint64_t globalDims[2] = {globalDim0, globalDim1};
-    uint64_t globalStrides[1] = {globalDim0 * sizeof(bf16)}; // stride of dim-1 in bytes
+    uint64_t globalStrides[1] = {globalDim0 * elem_bytes}; // stride of dim-1 in bytes
     uint32_t boxDims[2] = {boxDim0, boxDim1};
     uint32_t elementStrides[2] = {1, 1};
 
     CUresult res = cuTensorMapEncodeTiled(
         map,
-        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        dtype,
         2, // rank
         (void *)gmem_ptr,
         globalDims,
@@ -108,6 +110,16 @@ static inline TMADescriptor create_tma_desc_2d(
         exit(EXIT_FAILURE);
     }
     return desc;
+}
+
+static inline TMADescriptor create_tma_desc_2d(
+    const bf16 *gmem_ptr,
+    uint32_t globalDim0, uint32_t globalDim1,
+    uint32_t boxDim0, uint32_t boxDim1,
+    CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE)
+{
+    return create_tma_desc_2d_raw(gmem_ptr, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, sizeof(bf16),
+                                  globalDim0, globalDim1, boxDim0, boxDim1, swizzle);
 }
 
 // ── mbarrier helpers (PTX) ─────────────────────────────────────────────

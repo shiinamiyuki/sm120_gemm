@@ -59,3 +59,18 @@ target_link_libraries(proto_tinym PRIVATE
     CUDA::cublas
     dl
 )
+
+# FP8 (e4m3) per-tensor-scaled GEMM: harness, FP32 reference, cuBLASLt baseline.
+add_executable(bench_fp8 src/bench_fp8.cu)
+
+target_compile_options(bench_fp8 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+)
+
+target_link_libraries(bench_fp8 PRIVATE
+    CUDA::cudart
+    CUDA::cuda_driver
+    CUDA::cublas
+    CUDA::cublasLt
+    dl
+)

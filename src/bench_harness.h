@@ -1,6 +1,8 @@
 #pragma once
 #include "common.h"
-#include "kernel_jit.h"
+// Only the config types are needed here; the JIT is the caller's business, so
+// check()/time() are templated on the kernel rather than tied to CompiledKernel.
+#include "gemm_config.h"
 
 #include <cublas_v2.h>
 #include <algorithm>
@@ -209,7 +211,8 @@ public:
     // Run once and compare against the fp32 reference. A launch failure is
     // reported as a failed check rather than aborting, so an autotune sweep
     // can keep going.
-    CheckResult check(const CompiledKernel &kern, float tol) {
+    template <class Kernel>
+    CheckResult check(const Kernel &kern, float tol) {
         ensure_references();
         size_t n = (size_t)M_ * N_;
         CheckResult r;
@@ -248,7 +251,8 @@ public:
         }
     }
 
-    double time(const CompiledKernel &kern, const BenchOptions &opt) {
+    template <class Kernel>
+    double time(const Kernel &kern, const BenchOptions &opt) {
         return bench_ms([&] {
             size_t b = buf_idx_++ % num_bufs_;
             kern.fn(M_, N_, K_, X_[b].data, W_[b].data, Y_[b].data, workspace_.data, stream_);

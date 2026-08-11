@@ -5,6 +5,7 @@
 // fp32 references, L2-flushing timing) so correctness and bandwidth can be
 // judged before committing to a configuration space.
 #include "bench_harness.h"
+#include "kernel_jit.h"
 #include "bf16_gemm_tinym.cuh"
 
 #include <array>

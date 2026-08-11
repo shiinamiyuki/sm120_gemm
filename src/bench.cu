@@ -1,4 +1,5 @@
 #include "bench_harness.h"
+#include "kernel_jit.h"
 
 #include <array>
 #include <optional>
