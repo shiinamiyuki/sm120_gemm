@@ -24,16 +24,20 @@ Computes $Y = X \cdot W^T$ where $X$ is $(M \times K)$ BF16, $W$ is $(N \times K
 src/
   bf16_gemm.cuh        # Core GEMM kernel: TMA, mbarrier pipeline,
                        # MMA loop, split-K, and launch logic
+  bf16_gemm_tinym.cuh  # Tiny-M variant (M <= 8): same pipeline, CUDA-core
+                       # consumer instead of tensor cores
   common.h             # CUDA error checking, benchmarking utility
   gemm_config.h        # Config parsing/validation, config-space enumeration,
                        # autotune cache
   kernel_jit.h         # On-the-fly nvcc compilation, content-hashed .so cache,
                        # dlopen of compiled kernels
-  kernel_entry.cu      # JIT translation unit — instantiates one BF16GemmMMA
-                       # from -D defines
+  kernel_entry.cu      # JIT translation unit — instantiates one BF16GemmMMA or
+                       # BF16GemmTinyM from -D defines
   bench_harness.h      # CUDA buffers, cuBLAS + FP32 references, correctness
                        # checking, L2-flushing timing
   bench.cu             # Command line and the bench/autotune modes
+  proto_tinym.cu       # Standalone driver for the tiny-M kernel: synthetic
+                       # correctness probes and a fixed variant sweep
 ```
 
 ## Requirements
@@ -100,61 +104,100 @@ Tokens may be given in any order and omitted tokens take a default, so `--config
 
 Defaults are `BK=64`, `NUM_STAGES=3`, `CWG=2`, `SPLIT_K=1`. If the warp tile is omitted, the most square `WARP_M x WARP_N` that exactly covers `BM x BN` with `CWG * 4` warps is chosen.
 
-| Parameter | Values | Description |
-|-----------|--------|-------------|
-| `BM` | 64, 128 | Tile size along M |
-| `BN` | 64, 128 | Tile size along N |
-| `BK` | 64 | Tile size along K |
-| `NUM_STAGES` | 2, 3, 4 | Pipeline depth (bounded by shared memory) |
-| `CWG` | 1, 2 | Consumer warp groups (4 warps each) |
-| `WARP_M` | 16–128 | Per-warp tile along M (multiples of 16) |
-| `WARP_N` | 8–128 | Per-warp tile along N (multiples of 8) |
-| `SPLIT_K` | 1, 2 | K-dimension parallelism factor |
+### Kernel families
 
-Constraint: `(BM / WARP_M) * (BN / WARP_N) == CWG * 4` (total consumer warps must tile the output block exactly). The sweep enumerates 135 configurations within a 128 KB shared-memory budget; on a device with a 99 KB per-block limit, 122 of them are runnable.
+Configs come in two families, both sharing the producer / TMA / mbarrier pipeline and differing only in the consumer. A leading `tinym` token selects the CUDA-core kernel, which has no warp tile:
+
+```
+128x128x64_s3_cwg2_w32x32_sk1      tensor cores (BF16GemmMMA),   needs M % BM == 0
+tinym_8x256x64_s2_cwg1_sk8         CUDA cores  (BF16GemmTinyM),  for M <= BM
+```
+
+The tiny-M family targets skinny GEMMs (M ≤ 8), where `mma.m16n8k16` would waste ≥ 50% of every instruction and the problem is bandwidth-bound anyway. Each thread owns all `BM` rows and `BN / (CWG*128)` columns of n, accumulating in registers with plain FP32 FMAs. Split-K matters far more here: with no M-parallelism, `N/BN` tiles alone leave most SMs idle.
+
+Both families are enumerated into the same search space, and `--autotune` picks between them automatically — `fits_shape` keeps tiny-M configs out of the running for anything but `M <= BM`, so a large-M sweep never pays to compile them. Kernels that register-spill are rejected at compile time from the ptxas report and never benchmarked, since they have already lost.
+
+| Parameter | Tensor core | Tiny-M | Description |
+|-----------|-------------|--------|-------------|
+| `BM` | 64, 128 | 4, 8 | Tile size along M |
+| `BN` | 64, 128 | 128, 256 | Tile size along N |
+| `BK` | 64 | 64 | Tile size along K |
+| `NUM_STAGES` | 2, 3, 4 | 2, 3, 4 | Pipeline depth (bounded by shared memory) |
+| `CWG` | 1, 2 | 1, 2 | Consumer warp groups (4 warps each) |
+| `WARP_M` | 16–128 | — | Per-warp tile along M (multiples of 16) |
+| `WARP_N` | 8–128 | — | Per-warp tile along N (multiples of 8) |
+| `SPLIT_K` | 1, 2 | 1, 2, 4, 8, 16 | K-dimension parallelism factor |
+
+Constraint: `(BM / WARP_M) * (BN / WARP_N) == CWG * 4` (total consumer warps must tile the output block exactly). The tensor-core sweep enumerates 135 configurations within a 128 KB shared-memory budget; on a device with a 99 KB per-block limit, 122 of them are runnable, plus 50 tiny-M configurations (`BM` ∈ {4, 8}, `BN` ∈ {128, 256}, `SPLIT_K` up to 16).
 
 ## Results (RTX 5090)
 
+Sorted by M. The decode-sized rows (M <= 8) run the tiny-M CUDA-core kernel; everything from M=128 up runs the tensor-core kernel. `--autotune` chooses between the families on its own. Note that TFLOPS is the wrong yardstick for the small-M rows: they are bandwidth-bound at roughly 1.5 TB/s, so the percentage of cuBLAS is what matters.
+
 ```
-=== M=128 N=4096 K=14336  config=64x64x64_s4_cwg2_w32x16_sk1 ===
-  cuBLAS    0.1082 ms  138.9397 TFLOPS
-  ours      0.1064 ms  141.2754 TFLOPS  (101.7% of cuBLAS)
+=== M=1 N=4096 K=14336  config=tinym_4x256x64_s2_cwg1_sk8 ===
+  cuBLAS    0.0764 ms    1.5377 TFLOPS
+  ours      0.0760 ms    1.5461 TFLOPS  (100.5% of cuBLAS)
+
+=== M=1 N=28672 K=4096  config=tinym_4x256x64_s2_cwg1_sk4 ===
+  cuBLAS    0.1416 ms    1.6593 TFLOPS
+  ours      0.1452 ms    1.6176 TFLOPS  (97.5% of cuBLAS)
+
+=== M=4 N=4096 K=14336  config=tinym_4x256x64_s2_cwg1_sk8 ===
+  cuBLAS    0.0787 ms    5.9677 TFLOPS
+  ours      0.0772 ms    6.0839 TFLOPS  (101.9% of cuBLAS)
+
+=== M=4 N=28672 K=4096  config=tinym_4x256x64_s2_cwg1_sk4 ===
+  cuBLAS    0.1565 ms    6.0042 TFLOPS
+  ours      0.1460 ms    6.4346 TFLOPS  (107.2% of cuBLAS)
+
+=== M=8 N=4096 K=14336  config=tinym_8x256x64_s2_cwg1_sk8 ===
+  cuBLAS    0.0919 ms   10.2197 TFLOPS
+  ours      0.0783 ms   12.0048 TFLOPS  (117.5% of cuBLAS)
+
+=== M=8 N=28672 K=4096  config=tinym_8x256x64_s2_cwg1_sk1 ===
+  cuBLAS    0.1566 ms   11.9966 TFLOPS
+  ours      0.1493 ms   12.5884 TFLOPS  (104.9% of cuBLAS)
+
+=== M=128 N=4096 K=14336  config=64x128x64_s4_cwg2_w32x32_sk2 ===
+  cuBLAS    0.1068 ms  140.7970 TFLOPS
+  ours      0.1047 ms  143.6427 TFLOPS  (102.0% of cuBLAS)
 
 === M=128 N=28672 K=4096  config=128x64x64_s3_cwg2_w32x32_sk1 ===
-  cuBLAS    0.1906 ms  157.7666 TFLOPS
-  ours      0.1909 ms  157.5220 TFLOPS  (99.8% of cuBLAS)
+  cuBLAS    0.1905 ms  157.7878 TFLOPS
+  ours      0.1907 ms  157.6859 TFLOPS  (99.9% of cuBLAS)
 
-=== M=512 N=512 K=14336  config=64x64x64_s4_cwg2_w16x32_sk2 ===
-  cuBLAS    0.0462 ms  162.7333 TFLOPS
-  ours      0.0534 ms  140.6263 TFLOPS  (86.4% of cuBLAS)
+=== M=512 N=512 K=14336  config=64x64x64_s3_cwg2_w16x32_sk2 ===
+  cuBLAS    0.0460 ms  163.3160 TFLOPS
+  ours      0.0532 ms  141.2733 TFLOPS  (86.5% of cuBLAS)
 
-=== M=1024 N=1024 K=1024  config=64x128x64_s3_cwg2_w16x64_sk1 ===
-  cuBLAS    0.0186 ms  115.3965 TFLOPS
-  ours      0.0188 ms  114.3544 TFLOPS  (99.1% of cuBLAS)
+=== M=1024 N=1024 K=1024  config=128x64x64_s2_cwg2_w32x32_sk1 ===
+  cuBLAS    0.0185 ms  116.1656 TFLOPS
+  ours      0.0185 ms  116.0952 TFLOPS  (99.9% of cuBLAS)
 
-=== M=1024 N=1024 K=14336  config=128x64x64_s2_cwg2_w32x32_sk1 ===
-  cuBLAS    0.1797 ms  167.3434 TFLOPS
-  ours      0.1939 ms  155.0498 TFLOPS  (92.7% of cuBLAS)
+=== M=1024 N=1024 K=14336  config=128x128x64_s3_cwg2_w64x32_sk2 ===
+  cuBLAS    0.1796 ms  167.4448 TFLOPS
+  ours      0.1909 ms  157.5273 TFLOPS  (94.1% of cuBLAS)
 
-=== M=2048 N=2048 K=2048  config=64x64x64_s4_cwg2_w16x32_sk1 ===
-  cuBLAS    0.1127 ms  152.4357 TFLOPS
-  ours      0.1082 ms  158.8000 TFLOPS  (104.2% of cuBLAS)
+=== M=2048 N=2048 K=2048  config=64x64x64_s4_cwg2_w32x16_sk1 ===
+  cuBLAS    0.1127 ms  152.4833 TFLOPS
+  ours      0.1087 ms  158.0822 TFLOPS  (103.7% of cuBLAS)
 
-=== M=4096 N=4096 K=4096  config=128x64x64_s3_cwg2_w32x32_sk1 ===
-  cuBLAS    0.7027 ms  195.5783 TFLOPS
-  ours      0.6917 ms  198.6907 TFLOPS  (101.6% of cuBLAS)
+=== M=4096 N=4096 K=4096  config=64x64x64_s4_cwg2_w16x32_sk1 ===
+  cuBLAS    0.7027 ms  195.5997 TFLOPS
+  ours      0.6905 ms  199.0350 TFLOPS  (101.8% of cuBLAS)
 
-=== M=4096 N=4096 K=14336  config=64x128x64_s2_cwg2_w64x16_sk1 ===
-  cuBLAS    2.3678 ms  203.1534 TFLOPS
-  ours      2.3718 ms  202.8156 TFLOPS  (99.8% of cuBLAS)
+=== M=4096 N=4096 K=14336  config=64x128x64_s3_cwg2_w32x32_sk2 ===
+  cuBLAS    2.2388 ms  214.8659 TFLOPS
+  ours      2.3702 ms  202.9486 TFLOPS  (94.5% of cuBLAS)
 
-=== M=4096 N=28672 K=4096  config=128x64x64_s3_cwg2_w16x64_sk1 ===
-  cuBLAS    4.4580 ms  215.8105 TFLOPS
-  ours      4.4231 ms  217.5125 TFLOPS  (100.8% of cuBLAS)
+=== M=4096 N=28672 K=4096  config=128x64x64_s2_cwg2_w64x16_sk1 ===
+  cuBLAS    4.4766 ms  214.9109 TFLOPS
+  ours      4.4260 ms  217.3669 TFLOPS  (101.1% of cuBLAS)
 
-=== M=8192 N=8192 K=8192  config=64x128x64_s2_cwg2_w32x32_sk1 ===
-  cuBLAS    5.0894 ms  216.0408 TFLOPS
-  ours      5.0695 ms  216.8886 TFLOPS  (100.4% of cuBLAS)
+=== M=8192 N=8192 K=8192  config=64x128x64_s2_cwg2_w64x16_sk1 ===
+  cuBLAS    5.0885 ms  216.0768 TFLOPS
+  ours      5.0765 ms  216.5878 TFLOPS  (100.2% of cuBLAS)
 ```
 
-Test cases include both square matrices and **LLaMA 3 8B** shapes (upgate projection 4096×28672×4096, downproj 4096×4096×14336, and their batch-128 variants).
+Test cases include both square matrices and **LLaMA 3 8B** shapes — upgate projection (N=28672, K=4096) and downproj (N=4096, K=14336) — swept across batch sizes from 4096 down to the decode-time M=1.

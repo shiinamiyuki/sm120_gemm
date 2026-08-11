@@ -166,6 +166,26 @@ __device__ __forceinline__ void named_barrier_sync(uint32_t barrier_id, uint32_t
     asm volatile("bar.sync %0, %1;" ::"r"(barrier_id), "r"(num_threads) : "memory");
 }
 
+// ── Tile rasterization ─────────────────────────────────────────────────
+// Map a linear tile id to (bm, bn), walking M-major within super-columns of
+// swizzle_width N-tiles so that concurrent CTAs touch overlapping rows of W
+// and X, which keeps them resident in L2.
+__device__ __forceinline__ void rasterize_tile_swizzled(
+    int tile_id, int num_tiles_m, int num_tiles_n, int swizzle_width,
+    int &bm, int &bn)
+{
+    // Clamp swizzle width to actual N tiles
+    int sw = swizzle_width < num_tiles_n ? swizzle_width : num_tiles_n;
+    int tiles_per_super_col = num_tiles_m * sw;
+    int super_col = tile_id / tiles_per_super_col;
+    int within = tile_id % tiles_per_super_col;
+    int bn_base = super_col * sw;
+    // Handle last partial super-column
+    int actual_sw = (bn_base + sw <= num_tiles_n) ? sw : (num_tiles_n - bn_base);
+    bm = within / actual_sw;
+    bn = bn_base + within % actual_sw;
+}
+
 // ── Tensor-core fragment movement (PTX) ────────────────────────────────
 // ldmatrix loads 8x8 b16 matrices from shared memory straight into the
 // register layout mma.sync expects; each lane supplies the address of one
@@ -245,14 +265,42 @@ __device__ __forceinline__ int swizzle_smem_offset(int row, int col, int row_ele
 // BF16GemmMMA — uses mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
 // ════════════════════════════════════════════════════════════════════════
 //
-// Warp tiling: each consumer warp handles a WARP_M × WARP_N region of the
-// output tile. The warp iterates over (WARP_M/16) × (WARP_N/8) MMA tiles
-// and (BK/16) k-inner steps per pipeline stage.
+// ── Work decomposition ────────────────────────────────────────────────
 //
-// WARP_M, WARP_N are template parameters so the user can tune them.
-// Constraint: num_consumer_warps * WARP_M * WARP_N == BM * BN
-//   where num_consumer_warps = CWG * 4.
-// Default arrangement: warps are laid out in a 2D grid over the BM×BN tile.
+//   CTA     BM x BN outputs, over the full k-range (or a 1/SPLIT_K slice).
+//   warp    WARP_M x WARP_N. The CWG*4 consumer warps form a
+//           WARPS_M x WARPS_N grid over the CTA tile:
+//             warp_row = w / WARPS_N,  warp_col = w % WARPS_N
+//           Constraint: WARPS_M * WARPS_N == CWG * 4, equivalently
+//           num_consumer_warps * WARP_M * WARP_N == BM * BN.
+//           WARP_M / WARP_N are template parameters, so this is tunable.
+//   mma     Each warp walks MMA_M = WARP_M/16 by MMA_N = WARP_N/8 tiles of
+//           m16n8k16, with MMA_K = BK/16 k-steps per pipeline stage.
+//   thread  Each of the 32 lanes owns 4 of the 128 (= 16x8) accumulators of
+//           one m16n8 tile, so a thread holds
+//           ACC_REGS = MMA_M * MMA_N * 4 floats in registers.
+//
+// ── Per-lane MMA fragment layout ──────────────────────────────────────
+//
+// One mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 computes
+//     D[16x8] = A[16x16] * B[16x8] + C[16x8]
+// with A row-major (X), B column-major (W: n-major, k contiguous), C/D fp32.
+// Writing  group = lane >> 2  (0..7)  and  lig = lane & 3  (0..3), each lane
+// holds these elements of the tile:
+//
+//   A   a[0]   m = group      k = lig*2 + {0,1}
+//       a[1]   m = group + 8  k = lig*2 + {0,1}
+//       a[2]   m = group      k = lig*2 + {0,1} + 8
+//       a[3]   m = group + 8  k = lig*2 + {0,1} + 8
+//   B   b[0]   n = group      k = lig*2 + {0,1}
+//       b[1]   n = group      k = lig*2 + {0,1} + 8
+//   C   c[0]   m = group      n = lig*2
+//       c[1]   m = group      n = lig*2 + 1
+//       c[2]   m = group + 8  n = lig*2
+//       c[3]   m = group + 8  n = lig*2 + 1
+//
+// ldmatrix delivers exactly this layout and stmatrix consumes it, which is
+// what the lane->address expressions at each call site below are computing.
 //
 // SPLIT_K partitions the K dimension across SPLIT_K CTAs, which improves SM
 // utilization when there are fewer output tiles than SMs. It changes only the
@@ -301,16 +349,7 @@ struct BF16GemmMMA
     // Rasterize tile_id to (bm, bn) with swizzled ordering for L2 locality
     __device__ static void rasterize_tile(int tile_id, int num_tiles_m, int num_tiles_n, int &bm, int &bn)
     {
-        // Clamp swizzle width to actual N tiles
-        int sw = SWIZZLE_WIDTH < num_tiles_n ? SWIZZLE_WIDTH : num_tiles_n;
-        int tiles_per_super_col = num_tiles_m * sw;
-        int super_col = tile_id / tiles_per_super_col;
-        int within = tile_id % tiles_per_super_col;
-        int bn_base = super_col * sw;
-        // Handle last partial super-column
-        int actual_sw = (bn_base + sw <= num_tiles_n) ? sw : (num_tiles_n - bn_base);
-        bm = within / actual_sw;
-        bn = bn_base + within % actual_sw;
+        rasterize_tile_swizzled(tile_id, num_tiles_m, num_tiles_n, SWIZZLE_WIDTH, bm, bn);
     }
 
     struct SMemStorage
@@ -466,7 +505,16 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
                 {
                     const int k_base = ki * 16;
 
-                    // Preload all B fragments for this k-step via ldmatrix
+                    // Preload all B fragments for this k-step via ldmatrix.
+                    // B for one m16n8k16 tile is 16(k) x 8(n) = two 8x8 b16
+                    // matrices. ldmatrix.x2 takes one row address from each of
+                    // lanes 0..15:
+                    //   lanes  0-7  -> matrix 0 = W[n_base+0..7][k_base+0..7 ] -> b[0]
+                    //   lanes  8-15 -> matrix 1 = W[n_base+0..7][k_base+8..15] -> b[1]
+                    // so the address is row n_base + (lane&7), column
+                    // k_base + 8*((lane>>3)&1). Each 8x8 is then distributed so
+                    // lane l holds (n = l>>2, k = (l&3)*2 + {0,1}) — the B
+                    // layout tabulated at the top of this file.
                     uint32_t b_frag[P::MMA_N][2];
                     for (int ni = 0; ni < P::MMA_N; ni++)
                     {
@@ -481,7 +529,16 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
                     {
                         const int m_base = m_warp_base + mi * 16;
 
-                        // Load A fragment via ldmatrix (only depends on mi, ki)
+                        // Load A fragment via ldmatrix (only depends on mi, ki).
+                        // A for one m16n8k16 tile is 16(m) x 16(k) = four 8x8
+                        // b16 matrices; ldmatrix.x4 takes a row address from
+                        // every lane:
+                        //   lanes  0-7  -> matrix 0 = X[m_base+0..7 ][k_base+0..7 ] -> a[0]
+                        //   lanes  8-15 -> matrix 1 = X[m_base+8..15][k_base+0..7 ] -> a[1]
+                        //   lanes 16-23 -> matrix 2 = X[m_base+0..7 ][k_base+8..15] -> a[2]
+                        //   lanes 24-31 -> matrix 3 = X[m_base+8..15][k_base+8..15] -> a[3]
+                        // which is why the row is (lane&7) + 8*((lane>>3)&1)
+                        // and the column advances by 8*(lane>>4).
                         uint32_t a[4];
                         {
                             int a_row = m_base + (lane_id & 7) + ((lane_id >> 3) & 1) * 8;
@@ -529,6 +586,13 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
 
                 bf16 *sY = smem.Y_out;
 
+                // stmatrix is the inverse of the B-side ldmatrix. Per m16n8
+                // tile the warp writes 16(m) x 8(n) as two 8x8 matrices:
+                // c0 packs c[0],c[1] (row `group`, columns lig*2 and +1) into
+                // matrix 0, c1 packs c[2],c[3] (row group+8) into matrix 1.
+                // Note the two distinct lane roles — a lane *holds* the data
+                // for row lane>>2, but *supplies the address* of row
+                // (lane&7) + 8*((lane>>3)&1), lanes 0-15 only.
                 for (int mi = 0; mi < P::MMA_M; mi++)
                 {
                     for (int ni = 0; ni < P::MMA_N; ni++)
@@ -562,6 +626,10 @@ __global__ void __launch_bounds__(BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_
             {
                 // Store f32 partial results directly to the global workspace;
                 // splitk_reduce_kernel sums the SPLIT_K slices afterwards.
+                // This writes the C layout out verbatim: per m16n8 tile a lane
+                // owns rows group = lane>>2 and group+8, at the adjacent
+                // columns lig*2 and lig*2+1 — hence the two 2-element runs at
+                // row0 and row0+8 below.
                 float *ws = workspace + (size_t)split_idx * M * N;
                 const int gm_base = bm * BM;
                 const int gn_base = bn * BN;

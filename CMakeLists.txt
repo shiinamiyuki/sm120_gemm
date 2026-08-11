@@ -36,3 +36,26 @@ target_link_libraries(bench PRIVATE
     CUDA::cublas
     dl
 )
+
+# Prototype driver for the tiny-M CUDA-core kernel. Unlike the tensor-core
+# kernels this one is compiled straight into the binary, not JIT'd.
+add_executable(proto_tinym src/proto_tinym.cu)
+
+target_compile_options(proto_tinym PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --ptxas-options=-v,-warn-spills>
+)
+
+target_compile_definitions(proto_tinym PRIVATE
+    GEMM_NVCC="${CMAKE_CUDA_COMPILER}"
+    GEMM_SRC_DIR="${CMAKE_SOURCE_DIR}/src"
+    GEMM_JIT_CACHE_DIR="${KERNEL_JIT_CACHE_DIR}"
+    GEMM_CUDA_STUB_DIR="${CUDAToolkit_LIBRARY_DIR}/stubs"
+    GEMM_CUDA_ARCH="${GEMM_CUDA_ARCH}"
+)
+
+target_link_libraries(proto_tinym PRIVATE
+    CUDA::cudart
+    CUDA::cuda_driver
+    CUDA::cublas
+    dl
+)

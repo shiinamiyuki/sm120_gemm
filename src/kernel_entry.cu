@@ -1,11 +1,17 @@
 // Translation unit compiled on the fly by KernelJit (see kernel_jit.h).
 // One .so per configuration; the tile parameters arrive as -D defines.
-#include "bf16_gemm.cuh"
+#include "bf16_gemm_tinym.cuh" // also pulls in bf16_gemm.cuh
 
 #if !defined(GEMM_BM) || !defined(GEMM_BN) || !defined(GEMM_BK) ||     \
     !defined(GEMM_STAGES) || !defined(GEMM_CWG) || !defined(GEMM_WM) || \
     !defined(GEMM_WN) || !defined(GEMM_SPLIT_K)
 #error "kernel_entry.cu requires -DGEMM_{BM,BN,BK,STAGES,CWG,WM,WN,SPLIT_K}"
+#endif
+
+// Kernel family selector: 0 = BF16GemmMMA (tensor cores), 1 = BF16GemmTinyM
+// (CUDA cores, M <= BM). GEMM_WM/GEMM_WN are unused when tiny-M is selected.
+#ifndef GEMM_TINYM
+#define GEMM_TINYM 0
 #endif
 
 static constexpr int BM = GEMM_BM;
@@ -23,6 +29,11 @@ extern "C" void gemm_run(int M, int N, int K,
     auto *x = static_cast<const bf16 *>(X);
     auto *w = static_cast<const bf16 *>(W);
     auto *y = static_cast<bf16 *>(Y);
+#if GEMM_TINYM
+    BF16GemmTinyM<BM, BN, BK, NUM_STAGES, CWG, SPLIT_K>::run(
+        M, N, K, x, w, y, workspace, stream);
+#else
     BF16GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, SPLIT_K>::run(
         M, N, K, x, w, y, workspace, stream);
+#endif
 }

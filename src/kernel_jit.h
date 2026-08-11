@@ -88,6 +88,15 @@ private:
     std::map<std::string, CompiledKernel> loaded_; // pointers must stay stable
     std::map<std::string, std::string> failed_;    // name -> reason
 
+    // Flags that affect codegen, shared by the fingerprint and the compile so
+    // the two can never drift. --ptxas-options=-v is always on rather than
+    // verbose-only: the spill counts it prints are load-bearing (see compile).
+    std::string common_flags() const {
+        return " -std=c++20 -O3 --use_fast_math -arch=sm_" + opts_.arch +
+               " -shared -Xcompiler -fPIC --cudart shared"
+               " --ptxas-options=-v,-warn-spills";
+    }
+
     std::string so_path(const GemmConfig &cfg) const {
         char buf[64];
         snprintf(buf, sizeof(buf), ".%016lx.so", fingerprint_);
@@ -157,7 +166,13 @@ private:
         if (!opts_.force) {
             if (fs::exists(out)) return Outcome::Cached;
             if (fs::exists(fail)) {
-                error = "nvcc failed previously, see " + log;
+                // The marker records why, so a cached rejection reads the same
+                // as a fresh one (nvcc error vs. register spill).
+                std::string reason = read_file(fail);
+                while (!reason.empty() && (reason.back() == '\n' || reason.back() == '\r'))
+                    reason.pop_back();
+                if (reason.empty()) reason = "previously failed";
+                error = reason + " (cached, see " + log + ")";
                 return Outcome::Failed;
             }
         }
@@ -166,10 +181,7 @@ private:
                           std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
 
         std::ostringstream cmd;
-        cmd << '"' << opts_.nvcc << '"'
-            << " -std=c++20 -O3 --use_fast_math"
-            << " -arch=sm_" << opts_.arch
-            << " -shared -Xcompiler -fPIC --cudart shared"
+        cmd << '"' << opts_.nvcc << '"' << common_flags()
             << " -I\"" << opts_.src_dir << '"'
             << " -DGEMM_BM=" << cfg.bm
             << " -DGEMM_BN=" << cfg.bn
@@ -178,23 +190,33 @@ private:
             << " -DGEMM_CWG=" << cfg.cwg
             << " -DGEMM_WM=" << cfg.warp_m
             << " -DGEMM_WN=" << cfg.warp_n
-            << " -DGEMM_SPLIT_K=" << cfg.split_k;
-        if (opts_.verbose) cmd << " --ptxas-options=-v,-warn-spills";
-        cmd << " \"" << opts_.src_dir << "/kernel_entry.cu\""
+            << " -DGEMM_SPLIT_K=" << cfg.split_k
+            << " -DGEMM_TINYM=" << (cfg.is_tiny_m() ? 1 : 0)
+            << " \"" << opts_.src_dir << "/kernel_entry.cu\""
             << " -o \"" << tmp << '"'
             << " -L\"" << opts_.cuda_stub_dir << "\" -lcuda"
             << " > \"" << log << "\" 2>&1";
 
+        std::error_code ec;
         int rc = std::system(cmd.str().c_str());
         if (rc != 0) {
-            std::error_code ec;
             fs::remove(tmp, ec);
             std::ofstream(fail) << "nvcc exit " << rc << "\n";
             error = "nvcc exit " + std::to_string(rc) + ", see " + log;
             return Outcome::Failed;
         }
 
-        std::error_code ec;
+        // Reject spilling kernels without ever running them. A kernel that
+        // spills is already slow enough to lose the autotune, so benchmarking
+        // it only costs time — and for the tiny-M family, whose per-thread X
+        // fragment grows with BM, spilling is a real part of the search space.
+        if (long spilled = spill_bytes(read_file(log)); spilled > 0) {
+            fs::remove(tmp, ec);
+            std::ofstream(fail) << "register spill: " << spilled << " bytes\n";
+            error = std::to_string(spilled) + " bytes register spill";
+            return Outcome::Failed;
+        }
+
         fs::rename(tmp, out, ec); // atomic within the cache dir
         if (ec) {
             fs::remove(tmp, ec);
@@ -202,6 +224,37 @@ private:
             return Outcome::Failed;
         }
         return Outcome::Built;
+    }
+
+    // The integer immediately preceding `marker`, or 0 if absent.
+    static long number_before(std::string_view line, const char *marker) {
+        size_t pos = line.find(marker);
+        if (pos == std::string_view::npos) return 0;
+        size_t end = pos;
+        while (end > 0 && line[end - 1] == ' ') end--;
+        size_t begin = end;
+        while (begin > 0 && isdigit((unsigned char)line[begin - 1])) begin--;
+        if (begin == end) return 0;
+        return strtol(std::string(line.substr(begin, end - begin)).c_str(), nullptr, 10);
+    }
+
+    // ptxas -v emits one resource line per entry function:
+    //   "8 bytes stack frame, 12 bytes spill stores, 12 bytes spill loads"
+    // Key off "bytes stack frame" so the separate "Registers are spilled to
+    // local memory" warning, which repeats the same two figures, is not
+    // counted twice.
+    static long spill_bytes(const std::string &log) {
+        long total = 0;
+        for (size_t pos = 0; pos < log.size();) {
+            size_t eol = log.find('\n', pos);
+            if (eol == std::string::npos) eol = log.size();
+            std::string_view line(log.data() + pos, eol - pos);
+            pos = eol + 1;
+            if (line.find("bytes stack frame") == std::string_view::npos) continue;
+            total += number_before(line, "bytes spill stores");
+            total += number_before(line, "bytes spill loads");
+        }
+        return total;
     }
 
     // FNV-1a over the kernel sources plus the toolchain/flags that affect
@@ -214,10 +267,11 @@ private:
                 h *= 1099511628211ull;
             }
         };
-        for (const char *f : {"kernel_entry.cu", "bf16_gemm.cuh", "common.h"})
+        for (const char *f : {"kernel_entry.cu", "bf16_gemm.cuh",
+                              "bf16_gemm_tinym.cuh", "common.h"})
             mix(read_file(opts_.src_dir + "/" + f));
         mix(opts_.nvcc);
-        mix(opts_.arch);
+        mix(common_flags());
         mix(run_capture('"' + opts_.nvcc + "\" --version 2>/dev/null"));
         return h;
     }

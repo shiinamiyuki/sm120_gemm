@@ -20,6 +20,13 @@ using GemmKernelFn = void (*)(int M, int N, int K,
                               const void *X, const void *W, void *Y,
                               float *workspace, cudaStream_t stream);
 
+// Which kernel template a config instantiates. Both share the producer /
+// TMA / mbarrier pipeline and differ only in the consumer.
+enum class KernelFamily {
+    Mma,   // BF16GemmMMA      — tensor cores, requires M % BM == 0
+    TinyM, // BF16GemmTinyM    — CUDA cores, for M <= BM (skinny GEMM)
+};
+
 // ── GEMM configuration ─────────────────────────────────────────────────
 //
 // Canonical string form (also used as the .so filename):
@@ -32,20 +39,39 @@ using GemmKernelFn = void (*)(int M, int N, int K,
 //      |          +------------------ NUM_STAGES
 //      +----------------------------- BM x BN x BK
 //
+// The tiny-M family carries a leading "tinym" token and no warp tile, since
+// its consumer has no MMA fragments to lay out:
+//
+//     tinym_8x256x64_s2_cwg1_sk8
+//
 // parse() accepts the tokens in any order and fills in defaults, so partial
-// specs work on the command line: "128x128", "128x128x64_sk2", "s4_cwg1_128x64".
+// specs work on the command line: "128x128", "128x128x64_sk2", "s4_cwg1_128x64",
+// "tinym_8x256".
 struct GemmConfig {
     int bm = 0, bn = 0, bk = 64;
     int stages = 3, cwg = 2;
-    int warp_m = 0, warp_n = 0; // 0 = derive from bm/bn/cwg
+    int warp_m = 0, warp_n = 0; // 0 = derive from bm/bn/cwg (Mma only)
     int split_k = 1;
+    // Last member so the aggregate initialisers below keep working.
+    KernelFamily family = KernelFamily::Mma;
+
+    bool is_tiny_m() const { return family == KernelFamily::TinyM; }
 
     std::string name() const {
         char buf[128];
-        snprintf(buf, sizeof(buf), "%dx%dx%d_s%d_cwg%d_w%dx%d_sk%d",
-                 bm, bn, bk, stages, cwg, warp_m, warp_n, split_k);
+        if (is_tiny_m())
+            snprintf(buf, sizeof(buf), "tinym_%dx%dx%d_s%d_cwg%d_sk%d",
+                     bm, bn, bk, stages, cwg, split_k);
+        else
+            snprintf(buf, sizeof(buf), "%dx%dx%d_s%d_cwg%d_w%dx%d_sk%d",
+                     bm, bn, bk, stages, cwg, warp_m, warp_n, split_k);
         return buf;
     }
+
+    // Consumer threads (the producer warp group is excluded).
+    int consumer_threads() const { return cwg * 128; }
+    // Tiny-M only: n-columns per consumer thread.
+    int npt() const { return bn / consumer_threads(); }
 
     // Constraints the kernel template asserts on. Returns "" if the config is
     // buildable, otherwise the reason — so a bad --config fails instantly
@@ -58,15 +84,31 @@ struct GemmConfig {
         };
         if (bm <= 0 || bn <= 0 || bk <= 0)
             return fail("tile dims must be positive (got %dx%dx%d)", bm, bn, bk);
-        if (bm % 16) return fail("BM=%d must be a multiple of 16 (mma.m16)", bm);
-        if (bn % 8) return fail("BN=%d must be a multiple of 8 (mma.n8)", bn);
-        if (bk % 16) return fail("BK=%d must be a multiple of 16 (mma.k16)", bk);
-        if (bk * (int)sizeof(bf16) < 128)
-            return fail("BK=%d gives a %zu-byte K row; 128B swizzle needs >= 128",
-                        bk, bk * sizeof(bf16));
         if (stages < 2) return fail("NUM_STAGES=%d must be >= 2 to pipeline", stages);
         if (cwg < 1) return fail("CWG=%d must be >= 1", cwg);
         if (split_k < 1) return fail("SPLIT_K=%d must be >= 1", split_k);
+        if (bk * (int)sizeof(bf16) < 128)
+            return fail("BK=%d gives a %zu-byte K row; 128B swizzle needs >= 128",
+                        bk, bk * sizeof(bf16));
+
+        if (is_tiny_m()) {
+            // Mirrors the static_asserts in BF16GemmTinyM.
+            if (bm > 256 || bn > 256 || bk > 256)
+                return fail("TMA box dims are capped at 256 (got %dx%dx%d)", bm, bn, bk);
+            if (bk % 8) return fail("BK=%d must be a multiple of 8 (16B vector loads)", bk);
+            if (bn % 8) return fail("BN=%d must be a multiple of 8 rows", bn);
+            if (bn % consumer_threads())
+                return fail("BN=%d must be a multiple of the %d consumer threads",
+                            bn, consumer_threads());
+            if (npt() < 1)
+                return fail("BN=%d < %d consumer threads; raise BN or lower CWG",
+                            bn, consumer_threads());
+            return {};
+        }
+
+        if (bm % 16) return fail("BM=%d must be a multiple of 16 (mma.m16)", bm);
+        if (bn % 8) return fail("BN=%d must be a multiple of 8 (mma.n8)", bn);
+        if (bk % 16) return fail("BK=%d must be a multiple of 16 (mma.k16)", bk);
         if (warp_m <= 0 || warp_n <= 0)
             return fail("warp tile is unset (%dx%d)", warp_m, warp_n);
         if (warp_m % 16) return fail("WARP_M=%d must be a multiple of 16", warp_m);
@@ -82,14 +124,26 @@ struct GemmConfig {
 
     // Can this config run this problem shape at all?
     bool fits_shape(int M, int N, int K) const {
-        if (M % bm || N % bn || K % bk) return false;
-        if (split_k > 1 && K % (bk * split_k)) return false;
-        return true;
+        if (N % bn || K % (bk * split_k)) return false;
+        // Tiny-M does not tile M: one row-tile covers it, with TMA zero-filling
+        // rows >= M. That also keeps these configs out of the running for any
+        // shape they were not meant for.
+        if (is_tiny_m()) return M <= bm;
+        return M % bm == 0;
     }
 
+    // Must agree exactly with sizeof(SMemStorage) in the matching kernel: it
+    // is what gates a launch against the device shared-memory limit.
     size_t smem_bytes() const {
-        size_t tile = (size_t)stages * (bm * bk + bk * bn) * sizeof(bf16);
         size_t barriers = 2 * (size_t)stages * sizeof(uint64_t);
+        if (is_tiny_m()) {
+            // The X stage stride is padded up to a whole 8-row (1024B) block
+            // so every stage lands on the same 128B-swizzle phase.
+            size_t x_rows = ((size_t)(bm + 7) / 8) * 8;
+            size_t tile = (size_t)stages * (x_rows * bk + (size_t)bk * bn) * sizeof(bf16);
+            return tile + barriers; // no smem Y staging: the epilogue goes direct
+        }
+        size_t tile = (size_t)stages * (bm * bk + bk * bn) * sizeof(bf16);
         size_t y_out = (split_k == 1) ? (size_t)bm * bn * sizeof(bf16) : 0;
         return tile + y_out + barriers;
     }
@@ -140,7 +194,11 @@ struct GemmConfig {
             auto bad = [&](const char *want) {
                 return set_err("bad token '" + std::string(tok) + "' (want " + want + ")");
             };
-            if (tok.rfind("sk", 0) == 0) {
+            if (tok == "tinym") {
+                c.family = KernelFamily::TinyM;
+            } else if (tok == "mma") {
+                c.family = KernelFamily::Mma;
+            } else if (tok.rfind("sk", 0) == 0) {
                 if (!scan_tail(tok, 2, c.split_k)) return bad("sk<n>");
             } else if (tok.rfind("cwg", 0) == 0) {
                 if (!scan_tail(tok, 3, c.cwg)) return bad("cwg<n>");
@@ -165,6 +223,12 @@ struct GemmConfig {
 
         if (!have_tile)
             return set_err("config '" + std::string(s) + "' has no BMxBN tile");
+        if (c.is_tiny_m()) {
+            if (c.warp_m || c.warp_n)
+                return set_err("config '" + std::string(s) +
+                               "' sets a warp tile, which the tiny-M family has no use for");
+            return c;
+        }
         if (c.warp_m == 0 && !c.derive_warp_tile())
             return set_err("no warp tile covers " + std::to_string(c.bm) + "x" +
                            std::to_string(c.bn) + " with " + std::to_string(c.cwg * 4) +
@@ -173,7 +237,41 @@ struct GemmConfig {
     }
 
     // Full sweep of the configuration space, filtered by shared-memory budget.
+    // Both families are enumerated; fits_shape() then keeps tiny-M configs out
+    // of the running for anything but M <= BM, so a large-M autotune never
+    // pays to compile them.
     static std::vector<GemmConfig> enumerate(size_t max_smem) {
+        std::vector<GemmConfig> out = enumerate_mma(max_smem);
+        for (auto &c : enumerate_tiny_m(max_smem)) out.push_back(c);
+        return out;
+    }
+
+    // Tiny-M leans on split-K far harder than the tensor-core family: with no
+    // M-parallelism, N/BN tiles alone leave most SMs idle.
+    static std::vector<GemmConfig> enumerate_tiny_m(size_t max_smem) {
+        std::vector<GemmConfig> out;
+        for (int bm : {4, 8})
+            for (int bn : {128, 256})
+                for (int bk : {64})
+                    for (int cwg : {1, 2})
+                        for (int sk : {1, 2, 4, 8, 16})
+                            for (int stages : {4, 3, 2}) {
+                                GemmConfig c{};
+                                c.family = KernelFamily::TinyM;
+                                c.bm = bm;
+                                c.bn = bn;
+                                c.bk = bk;
+                                c.stages = stages;
+                                c.cwg = cwg;
+                                c.split_k = sk;
+                                if (!c.validate().empty()) continue;
+                                if (c.smem_bytes() > max_smem) continue;
+                                out.push_back(c);
+                            }
+        return out;
+    }
+
+    static std::vector<GemmConfig> enumerate_mma(size_t max_smem) {
         std::vector<GemmConfig> out;
         for (int bm : {64, 128})
             for (int bn : {64, 128})

@@ -169,6 +169,16 @@ public:
     size_t num_bufs() const { return num_bufs_; }
     double tflops(double ms) const { return 2.0 * M_ * N_ * K_ / (ms * 1e-3) / 1e12; }
 
+    // Compulsory traffic for the operation: both operands in, result out.
+    // Split-K workspace round-trips are deliberately not counted, so their
+    // cost shows up as reduced effective bandwidth rather than an inflated
+    // figure. For skinny shapes this, not TFLOPS, is the number that matters:
+    // arithmetic intensity is ~M flop/byte, so small M is purely bandwidth work.
+    double bytes() const {
+        return ((double)M_ * K_ + (double)N_ * K_ + (double)M_ * N_) * sizeof(bf16);
+    }
+    double gbps(double ms) const { return bytes() / (ms * 1e-3) / 1e9; }
+
     // cuBLAS and naive-fp32 references, computed at most once per shape.
     // The device-side reference buffers are released again straight away;
     // only the host copies are kept.

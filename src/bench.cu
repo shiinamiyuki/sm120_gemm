@@ -5,7 +5,9 @@
 
 using Shape = std::array<int, 3>; // M, N, K
 
-// Square matrices plus LLaMA 3 8B projection shapes.
+// Square matrices plus LLaMA 3 8B projection shapes, swept from prefill-sized
+// batches down to the decode-sized ones (M <= 8) that the tiny-M family exists
+// for. M=1/4/8 spans both tiny-M tile heights: BM=4 covers M<=4, BM=8 covers 5..8.
 static const std::vector<Shape> kDefaultShapes = {
     {512, 512, 14336},
     {1024, 1024, 14336},
@@ -17,6 +19,12 @@ static const std::vector<Shape> kDefaultShapes = {
     {4096, 4096, 14336},     // downproj
     {128, 14336 * 2, 4096},  // upgate, batch 128
     {128, 4096, 14336},      // downproj, batch 128
+    {8, 14336 * 2, 4096},    // upgate, batch 8
+    {8, 4096, 14336},        // downproj, batch 8
+    {4, 14336 * 2, 4096},    // upgate, batch 4
+    {4, 4096, 14336},        // downproj, batch 4
+    {1, 14336 * 2, 4096},    // upgate, batch 1 (decode)
+    {1, 4096, 14336},        // downproj, batch 1 (decode)
 };
 
 struct Args {
@@ -154,9 +162,10 @@ static void report(Problem &p, const CompiledKernel &kern, const BenchOptions &o
                    const char *label) {
     double cublas_ms = p.time_cublas(opt);
     double ms = p.time(kern, opt);
-    printf("  cuBLAS  %8.4f ms  %8.4f TFLOPS\n", cublas_ms, p.tflops(cublas_ms));
-    printf("  %-6s  %8.4f ms  %8.4f TFLOPS  (%.1f%% of cuBLAS)\n",
-           label, ms, p.tflops(ms), 100.0 * cublas_ms / ms);
+    printf("  cuBLAS  %8.4f ms  %9.2f TFLOPS  %8.1f GB/s\n",
+           cublas_ms, p.tflops(cublas_ms), p.gbps(cublas_ms));
+    printf("  %-6s  %8.4f ms  %9.2f TFLOPS  %8.1f GB/s  (%.1f%% of cuBLAS)\n",
+           label, ms, p.tflops(ms), p.gbps(ms), 100.0 * cublas_ms / ms);
 }
 
 // The kernel aborts the process inside cudaFuncSetAttribute if it asks for
@@ -260,7 +269,8 @@ static int cmd_autotune(const Args &a, KernelJit &jit, AutotuneCache &cache, siz
 
         Problem p(M, N, K, handle, stream, max_split_k);
         double cublas_ms = p.time_cublas(a.bench);
-        printf("  cuBLAS  %8.4f ms  %8.4f TFLOPS\n", cublas_ms, p.tflops(cublas_ms));
+        printf("  %-32s %8.4f ms  %9.2f TFLOPS  %8.1f GB/s\n", "cuBLAS",
+               cublas_ms, p.tflops(cublas_ms), p.gbps(cublas_ms));
 
         const CompiledKernel *best = nullptr;
         double best_ms = 1e30;
@@ -273,8 +283,9 @@ static int cmd_autotune(const Args &a, KernelJit &jit, AutotuneCache &cache, siz
                 }
             }
             double ms = p.time(*kern, a.bench);
-            printf("  %-32s %8.4f ms  %8.4f TFLOPS  (%.1f%%)\n",
-                   kern->config.name().c_str(), ms, p.tflops(ms), 100.0 * cublas_ms / ms);
+            printf("  %-32s %8.4f ms  %9.2f TFLOPS  %8.1f GB/s  (%.1f%%)\n",
+                   kern->config.name().c_str(), ms, p.tflops(ms), p.gbps(ms),
+                   100.0 * cublas_ms / ms);
             if (ms < best_ms) {
                 best_ms = ms;
                 best = kern;
@@ -285,8 +296,8 @@ static int cmd_autotune(const Args &a, KernelJit &jit, AutotuneCache &cache, siz
             printf("  NO WORKING CONFIG\n");
             continue;
         }
-        printf("  BEST: %s  %.4f ms  %.4f TFLOPS  (%.1f%% of cuBLAS)\n",
-               best->config.name().c_str(), best_ms, p.tflops(best_ms),
+        printf("  BEST: %s  %.4f ms  %.2f TFLOPS  %.1f GB/s  (%.1f%% of cuBLAS)\n",
+               best->config.name().c_str(), best_ms, p.tflops(best_ms), p.gbps(best_ms),
                100.0 * cublas_ms / best_ms);
         cache.store(M, N, K, best->config, best_ms);
         cache.save(a.cache_path);
