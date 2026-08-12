@@ -25,20 +25,39 @@ struct JitOptions {
     std::string cache_dir = GEMM_JIT_CACHE_DIR;
     std::string cuda_stub_dir = GEMM_CUDA_STUB_DIR;
     std::string arch = GEMM_CUDA_ARCH;
+    // Translation unit to compile, and the sources whose contents feed the
+    // cache fingerprint. Both differ per element type; see Fp8JitOptions below.
+    std::string entry = "kernel_entry.cu";
+    std::vector<std::string> fingerprint_sources = {
+        "kernel_entry.cu", "bf16_gemm.cuh", "bf16_gemm_tinym.cuh", "common.h"};
     int jobs = 0;        // 0 = hardware concurrency
     bool force = false;  // rebuild even if cached / previously failed
     bool verbose = false;
 };
 
-struct CompiledKernel {
+// The fp8 kernels live in their own translation unit and export a `gemm_run`
+// that also takes the per-tensor scales.
+inline JitOptions fp8_jit_options() {
+    JitOptions o;
+    o.entry = "fp8_kernel_entry.cu";
+    o.fingerprint_sources = {"fp8_kernel_entry.cu", "fp8_gemm.cuh",
+                             "fp8_gemm_tinym.cuh", "bf16_gemm.cuh", "common.h"};
+    return o;
+}
+
+template <class Fn>
+struct CompiledKernelT {
     GemmConfig config;
-    GemmKernelFn fn = nullptr;
+    Fn fn = nullptr;
     void *dl_handle = nullptr;
 };
 
-class KernelJit {
+template <class Fn>
+class KernelJitT {
 public:
-    explicit KernelJit(JitOptions opts) : opts_(std::move(opts)) {
+    using Kernel = CompiledKernelT<Fn>;
+
+    explicit KernelJitT(JitOptions opts) : opts_(std::move(opts)) {
         if (opts_.jobs <= 0) {
             unsigned hw = std::thread::hardware_concurrency();
             opts_.jobs = hw ? (int)hw : 4;
@@ -50,23 +69,23 @@ public:
                    opts_.cache_dir.c_str(), fingerprint_, opts_.jobs);
     }
 
-    ~KernelJit() {
+    ~KernelJitT() {
         for (auto &[name, k] : loaded_)
             if (k.dl_handle) dlclose(k.dl_handle);
     }
 
-    KernelJit(const KernelJit &) = delete;
-    KernelJit &operator=(const KernelJit &) = delete;
+    KernelJitT(const KernelJitT &) = delete;
+    KernelJitT &operator=(const KernelJitT &) = delete;
 
     // Compile (if needed) and load one kernel. Returns nullptr on failure.
-    const CompiledKernel *get(const GemmConfig &cfg) {
+    const Kernel *get(const GemmConfig &cfg) {
         auto r = get_many({cfg});
         return r.empty() ? nullptr : r.front();
     }
 
     // Compile a batch in parallel, then load. Failed configs are dropped, so
     // the result may be shorter than the input.
-    std::vector<const CompiledKernel *> get_many(const std::vector<GemmConfig> &cfgs) {
+    std::vector<const Kernel *> get_many(const std::vector<GemmConfig> &cfgs) {
         std::vector<GemmConfig> todo;
         for (auto &c : cfgs)
             if (!loaded_.count(c.name()) && !failed_.count(c.name()))
@@ -74,7 +93,7 @@ public:
 
         if (!todo.empty()) build_all(todo);
 
-        std::vector<const CompiledKernel *> out;
+        std::vector<const Kernel *> out;
         for (auto &c : cfgs) {
             auto it = loaded_.find(c.name());
             if (it != loaded_.end()) out.push_back(&it->second);
@@ -85,14 +104,19 @@ public:
 private:
     JitOptions opts_;
     uint64_t fingerprint_ = 0;
-    std::map<std::string, CompiledKernel> loaded_; // pointers must stay stable
-    std::map<std::string, std::string> failed_;    // name -> reason
+    std::map<std::string, Kernel> loaded_;      // pointers must stay stable
+    std::map<std::string, std::string> failed_; // name -> reason
 
     // Flags that affect codegen, shared by the fingerprint and the compile so
     // the two can never drift. --ptxas-options=-v is always on rather than
     // verbose-only: the spill counts it prints are load-bearing (see compile).
+    //
+    // -gencode rather than -arch: `nvcc -arch=sm_120a` silently forwards
+    // -arch=compute_120 to ptxas, dropping the 'a', and architecture-specific
+    // instructions (the block-scaled fp8 MMA, for one) are then rejected.
     std::string common_flags() const {
-        return " -std=c++20 -O3 --use_fast_math -arch=sm_" + opts_.arch +
+        return " -std=c++20 -O3 --use_fast_math"
+               " -gencode arch=compute_" + opts_.arch + ",code=sm_" + opts_.arch +
                " -shared -Xcompiler -fPIC --cudart shared"
                " --ptxas-options=-v,-warn-spills";
     }
@@ -144,14 +168,14 @@ private:
                 printf("[jit] %s FAILED: %s\n", name.c_str(), failed_[name].c_str());
                 continue;
             }
-            auto fn = (GemmKernelFn)dlsym(h, "gemm_run");
+            auto fn = (Fn)dlsym(h, "gemm_run");
             if (!fn) {
                 failed_[name] = std::string("dlsym(gemm_run): ") + dlerror();
                 printf("[jit] %s FAILED: %s\n", name.c_str(), failed_[name].c_str());
                 dlclose(h);
                 continue;
             }
-            loaded_[name] = CompiledKernel{todo[i], fn, h};
+            loaded_[name] = Kernel{todo[i], fn, h};
         }
     }
 
@@ -192,7 +216,7 @@ private:
             << " -DGEMM_WN=" << cfg.warp_n
             << " -DGEMM_SPLIT_K=" << cfg.split_k
             << " -DGEMM_TINYM=" << (cfg.is_tiny_m() ? 1 : 0)
-            << " \"" << opts_.src_dir << "/kernel_entry.cu\""
+            << " \"" << opts_.src_dir << "/" << opts_.entry << '"'
             << " -o \"" << tmp << '"'
             << " -L\"" << opts_.cuda_stub_dir << "\" -lcuda"
             << " > \"" << log << "\" 2>&1";
@@ -267,8 +291,7 @@ private:
                 h *= 1099511628211ull;
             }
         };
-        for (const char *f : {"kernel_entry.cu", "bf16_gemm.cuh",
-                              "bf16_gemm_tinym.cuh", "common.h"})
+        for (const std::string &f : opts_.fingerprint_sources)
             mix(read_file(opts_.src_dir + "/" + f));
         mix(opts_.nvcc);
         mix(common_flags());
@@ -291,3 +314,8 @@ private:
         return out;
     }
 };
+
+using KernelJit = KernelJitT<GemmKernelFn>;
+using CompiledKernel = CompiledKernelT<GemmKernelFn>;
+using Fp8KernelJit = KernelJitT<Fp8GemmKernelFn>;
+using Fp8CompiledKernel = CompiledKernelT<Fp8GemmKernelFn>;

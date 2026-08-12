@@ -104,11 +104,14 @@ enum class Dist {
 // ── One FP8 problem: quantized inputs, references, timing ──────────────
 class Fp8Problem {
 public:
-    Fp8Problem(int M, int N, int K, cudaStream_t stream, Dist dist = Dist::Uniform)
+    Fp8Problem(int M, int N, int K, cudaStream_t stream, Dist dist = Dist::Uniform,
+               int max_split_k = 1)
         : M_(M), N_(N), K_(K), stream_(stream), dist_(dist) {
         std::vector<float> hX, hW;
         generate_inputs(hX, hW);
 
+        // Plain amax scaling -- deliberately NOT rounded to a power of two, so
+        // the kernel's arbitrary-scale path is what gets exercised by default.
         x_scale_ = amax(hX) / kE4M3Max;
         w_scale_ = amax(hW) / kE4M3Max;
 
@@ -143,6 +146,10 @@ public:
             W_.back().copy_from_host(qW.data(), stream_);
         }
 
+        // Split-K partials, sized from the largest SPLIT_K in the candidate set
+        // so no allocation ever lands inside a timed loop.
+        workspace_ = CUDABuffer<float>((size_t)std::max(1, max_split_k) * M * N);
+
         // cuBLASLt wants the scales as device scalars.
         d_x_scale_ = CUDABuffer<float>(1);
         d_w_scale_ = CUDABuffer<float>(1);
@@ -160,6 +167,7 @@ public:
     float w_scale() const { return w_scale_; }
     const float *x_scale_dev() const { return d_x_scale_.data; }
     const float *w_scale_dev() const { return d_w_scale_.data; }
+    float *workspace() const { return workspace_.data; }
     // Error introduced by quantizing the inputs themselves.
     AccuracyStats input_quant_error() const { return input_err_; }
 
@@ -281,7 +289,7 @@ private:
 
     std::vector<CUDABuffer<fp8e4m3>> X_, W_;
     std::vector<CUDABuffer<bf16>> Y_;
-    CUDABuffer<float> d_x_scale_, d_w_scale_;
+    CUDABuffer<float> d_x_scale_, d_w_scale_, workspace_;
 
     float x_scale_ = 1.0f, w_scale_ = 1.0f;
     AccuracyStats input_err_;

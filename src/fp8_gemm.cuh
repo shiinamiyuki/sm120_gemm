@@ -54,12 +54,78 @@ using fp8e4m3 = __nv_fp8_e4m3;
 //
 // ── Scaling ───────────────────────────────────────────────────────────
 //
-// Per-tensor: the caller passes the single product x_scale * w_scale and the
-// epilogue applies it to the fp32 accumulator before narrowing to bf16.
-// (A production kernel would take a device pointer so the scale can be
-// produced on-device; a host float is enough for the prototype.)
+// Per-tensor. The power-of-two part of each scale rides along in the MMA's
+// ue8m0 block-scale operands for free; only the mantissa residual reaches the
+// epilogue. Any positive scale is accepted.
+// (A production kernel would take device pointers so the scales can be
+// produced on-device; host floats are enough for the prototype.)
+
+// ── Block-scaled MMA (the fast path) ──────────────────────────────────
+//
+// mma.m16n8k32 with .f32 accumulate runs at HALF the tensor-core issue rate
+// on sm_120 — measured 350 TFLOPS against a 700 TFLOPS ceiling, and visible
+// in ncu as a tensor pipe 97% busy while the HMMA subpipe sits at 48%. The
+// block-scaled form (SASS: QMMA.SF.16832.F32.E4M3.E4M3.E8, which is exactly
+// what cuBLAS issues) runs at the full rate *and still accumulates in fp32*,
+// so it is a 2x win with no loss of precision.
+//
+// The scales are ue8m0: an 8-bit exponent, byte value b encoding 2^(b-127).
+// The instruction computes  D = (2^ea * A) x (2^eb * B) + C  (verified
+// numerically across several exponent pairs).
+//
+// ue8m0 can only express powers of two, so an arbitrary per-tensor scale is
+// split as  scale = m * 2^e  (frexp, m in [0.5,1)): the 2^e goes into the MMA
+// for free, and only the mantissa residual m survives into the epilogue as a
+// single multiply. cuBLAS takes the simpler route of feeding the MMA a
+// neutral 2^0 (its SASS literally does `MOV R5, 0x7f7f7f7f`) and applying the
+// whole scale in the epilogue with FFMA -- it cannot constrain a caller's
+// scale. Both cost one epilogue multiply; folding the exponent in just means
+// the residual is always in [0.25, 1) and can never overflow.
+//
+// All four scale bytes carry the same value under per-tensor scaling, so the
+// scale-fragment layout is irrelevant here -- {byte-id, thread-id} select
+// *which* byte, and every byte is equal. Real per-block scaling will have to
+// pin that layout down; per-tensor does not.
+//
+// NOTE: this instruction is architecture-specific and needs ptxas to see
+// -arch=sm_120a. `nvcc -arch=sm_120a` silently forwards -arch=compute_120
+// (dropping the 'a') and the instruction is then rejected; build with
+// -gencode arch=compute_120a,code=sm_120a, which is what CMake emits for
+// CMAKE_CUDA_ARCHITECTURES=120a.
+__device__ __forceinline__ void mma_m16n8k32_e4m3_scaled(float (&d)[4],
+                                                         const uint32_t (&a)[4],
+                                                         const uint32_t (&b)[2],
+                                                         uint32_t sf_a, uint32_t sf_b)
+{
+    asm volatile(
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X"
+        ".m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%0, %1, %2, %3}, "
+        "%10, {0, 0}, %11, {0, 0};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]), "r"(sf_a), "r"(sf_b));
+}
+
+// Split an arbitrary positive scale into the power-of-two part the MMA can
+// apply directly (returned as four identical ue8m0 bytes) and the mantissa
+// residual left for the epilogue. Any scale is accepted.
+inline uint32_t ue8m0_split(float scale, float &residual)
+{
+    if (!(scale > 0.0f))
+        throw std::runtime_error("fp8 dequantization scale must be positive");
+    int e = 0;
+    residual = frexpf(scale, &e); // scale == residual * 2^e, residual in [0.5, 1)
+    if (e < -127 || e > 128)
+        throw std::runtime_error("scale exponent out of ue8m0 range");
+    return (uint32_t)(127 + e) * 0x01010101u;
+}
 
 // D = A*B + D over one m16n8k32 e4m3 tile, accumulating in fp32.
+// Unscaled form: kept for the layout probe and as the slow-path reference.
 __device__ __forceinline__ void mma_m16n8k32_e4m3(float (&d)[4],
                                                   const uint32_t (&a)[4],
                                                   const uint32_t (&b)[2])
@@ -121,7 +187,7 @@ struct FP8GemmMMA
         const fp8e4m3 *__restrict__ X,
         const fp8e4m3 *__restrict__ W,
         bf16 *__restrict__ Y,
-        float scale, // x_scale * w_scale
+        float x_scale, float w_scale, // per-tensor dequant scales, any positive value
         cudaStream_t stream = nullptr);
 };
 
@@ -131,7 +197,8 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
     fp8_gemm_mma_kernel(
         int M, int N, int K,
         int num_tiles_m, int num_tiles_n, int total_tiles,
-        float scale,
+        uint32_t sf_x, uint32_t sf_w, // power-of-two part, applied by the MMA
+        float residual_scale,         // leftover mantissa, applied here
         __grid_constant__ const TMADescriptor tma_X,
         __grid_constant__ const TMADescriptor tma_W,
         __grid_constant__ const TMADescriptor tma_Y)
@@ -256,7 +323,7 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
                         }
 #pragma unroll
                         for (int ni = 0; ni < P::MMA_N; ni++)
-                            mma_m16n8k32_e4m3(acc[mi][ni], a, b_frag[ni]);
+                            mma_m16n8k32_e4m3_scaled(acc[mi][ni], a, b_frag[ni], sf_x, sf_w);
                     }
                 }
 
@@ -271,7 +338,7 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
 
             // ── Epilogue ───────────────────────────────────────────
             // Identical to the bf16 kernel: the m16n8 accumulator layout is
-            // the same, so only the dequantization scale is new.
+            // the same, and the dequantization scale is folded into the MMA.
             if (has_tma_store_in_flight)
             {
                 if (cwg_id == 0 && warp_in_wg == 0 && lane_id == 0)
@@ -280,15 +347,21 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
             }
 
             bf16 *sY = smem.Y_out;
+            #pragma unroll
             for (int mi = 0; mi < P::MMA_M; mi++)
             {
+                #pragma unroll
                 for (int ni = 0; ni < P::MMA_N; ni++)
                 {
                     int m_base = m_warp_base + mi * 16;
                     int n_base = n_warp_base + ni * 8;
 
-                    uint32_t c0 = f32x2_to_bf16x2(acc[mi][ni][0] * scale, acc[mi][ni][1] * scale);
-                    uint32_t c1 = f32x2_to_bf16x2(acc[mi][ni][2] * scale, acc[mi][ni][3] * scale);
+                    // The MMA already applied 2^ex * 2^ew; only the mantissa
+                    // residual is left (exactly 1.0 for power-of-two scales).
+                    uint32_t c0 = f32x2_to_bf16x2(acc[mi][ni][0] * residual_scale,
+                                                  acc[mi][ni][1] * residual_scale);
+                    uint32_t c1 = f32x2_to_bf16x2(acc[mi][ni][2] * residual_scale,
+                                                  acc[mi][ni][3] * residual_scale);
                     int st_row = m_base + (lane_id & 7) + ((lane_id >> 3) & 1) * 8;
                     stmatrix_x2(smem_u32(&sY[st_row * BN + n_base]), c0, c1);
                 }
@@ -328,7 +401,7 @@ void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N>::run(
     const fp8e4m3 *__restrict__ X,
     const fp8e4m3 *__restrict__ W,
     bf16 *__restrict__ Y,
-    float scale,
+    float x_scale, float w_scale,
     cudaStream_t stream)
 {
     if (M % BM != 0 || N % BN != 0 || K % BK != 0)
@@ -351,7 +424,10 @@ void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N>::run(
 
     auto kernel = fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N>;
     CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE));
+    float rx = 1.0f, rw = 1.0f;
+    uint32_t sf_x = ue8m0_split(x_scale, rx), sf_w = ue8m0_split(w_scale, rw);
     kernel<<<dim3(num_blocks), dim3(TOTAL_THREADS), SMEM_SIZE, stream>>>(
-        M, N, K, num_tiles_m, num_tiles_n, total_tiles, scale, tma_X, tma_W, tma_Y);
+        M, N, K, num_tiles_m, num_tiles_n, total_tiles,
+        sf_x, sf_w, rx * rw, tma_X, tma_W, tma_Y);
     CHECK_CUDA(cudaGetLastError());
 }

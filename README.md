@@ -1,6 +1,6 @@
 # A Zero-dependency GEMM library for RTX 50 series (SM120). 100% cuBLAS performance.
 
-A high-performance BF16 GEMM (General Matrix Multiply) implementation targeting NVIDIA RTX Blackwell (SM120) GPUs, written entirely in CUDA C++ with inline PTX. Achieves **100%+ of cuBLAS performance** on large matrix sizes, with no dependencies beyond the CUDA toolkit.
+A high-performance GEMM (General Matrix Multiply) implementation targeting NVIDIA RTX Blackwell (SM120) GPUs, written entirely in CUDA C++ with inline PTX. Achieves **100%+ of cuBLAS performance** on large matrix sizes, with no dependencies beyond the CUDA toolkit.
 
 Computes $Y = X \cdot W^T$ where $X$ is $(M \times K)$ BF16, $W$ is $(N \times K)$ BF16, and $Y$ is $(M \times N)$ BF16, with accumulation in FP32.
 
@@ -40,10 +40,12 @@ src/
                        # correctness probes and a fixed variant sweep
   fp8_gemm.cuh         # FP8 (e4m3) tensor-core kernel: bf16 kernel structure
                        # with mma.m16n8k32.e4m3 and per-tensor scaling
+  fp8_gemm_tinym.cuh   # FP8 tiny-M variant (M <= 8), CUDA-core consumer
+  fp8_kernel_entry.cu  # JIT translation unit for the FP8 kernels
   fp8_cublaslt.h       # Per-tensor-scaled FP8 (e4m3) GEMM via cuBLASLt
   fp8_harness.h        # FP8 quantization model, FP32 reference kernels,
                        # accuracy metrics, Fp8Problem
-  bench_fp8.cu         # FP8 baseline driver
+  bench_fp8.cu         # FP8 command line and the bench/autotune modes
 ```
 
 ## Requirements
@@ -59,7 +61,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-This builds a single `bench` executable in a few seconds. Kernels are **not** built here — `bench` compiles them on demand with `nvcc` and caches the resulting `.so` files under `build/jit_cache/`. The cache key includes a hash of the kernel sources, so editing `bf16_gemm.cuh` transparently invalidates every previously compiled kernel.
+This builds the `bench` (bf16) and `bench_fp8` (e4m3) executables in a few seconds. Kernels are **not** built here — both drivers compile them on demand with `nvcc` and cache the resulting `.so` files under `build/jit_cache/`. The cache key includes a hash of the kernel sources, so editing `bf16_gemm.cuh` transparently invalidates every previously compiled kernel.
 
 ## Usage
 
@@ -112,12 +114,16 @@ Defaults are `BK=64`, `NUM_STAGES=3`, `CWG=2`, `SPLIT_K=1`. If the warp tile is 
 
 ### Kernel families
 
-Configs come in two families, both sharing the producer / TMA / mbarrier pipeline and differing only in the consumer. A leading `tinym` token selects the CUDA-core kernel, which has no warp tile:
+Configs come in two families, both sharing the producer / TMA / mbarrier pipeline and differing only in the consumer. A leading `tinym` token selects the CUDA-core kernel, which has no warp tile. A leading `fp8` token selects the e4m3 element type — implied by `bench_fp8`, which only builds fp8 kernels, so it may be omitted there:
 
 ```
 128x128x64_s3_cwg2_w32x32_sk1      tensor cores (BF16GemmMMA),   needs M % BM == 0
 tinym_8x256x64_s2_cwg1_sk8         CUDA cores  (BF16GemmTinyM),  for M <= BM
+fp8_128x128x128_s2_cwg2_w64x32     tensor cores (FP8GemmMMA)
+fp8_tinym_4x256x128_s2_cwg1_sk16   CUDA cores  (FP8GemmTinyM)
 ```
+
+The element type changes everything derived from the element size: the smallest `BK` that fills a 128-byte swizzled smem row (64 for bf16, 128 for fp8), the MMA's k extent (16 vs 32), and the tiny-M vector-load width (8 vs 16 elements — the *byte* width stays 16). The default `BK` follows from it, so `--config 128x128` means `BK=64` under `bench` and `BK=128` under `bench_fp8`.
 
 The tiny-M family targets skinny GEMMs (M ≤ 8), where `mma.m16n8k16` would waste ≥ 50% of every instruction and the problem is bandwidth-bound anyway. Each thread owns all `BM` rows and `BN / (CWG*128)` columns of n, accumulating in registers with plain FP32 FMAs. Split-K matters far more here: with no M-parallelism, `N/BN` tiles alone leave most SMs idle.
 
@@ -125,29 +131,43 @@ Both families are enumerated into the same search space, and `--autotune` picks 
 
 | Parameter | Tensor core | Tiny-M | Description |
 |-----------|-------------|--------|-------------|
-| `BM` | 64, 128 | 4, 8 | Tile size along M |
+| `BM` | 64, 128 | 1, 2, 4, 8 | Tile size along M |
 | `BN` | 64, 128 | 128, 256 | Tile size along N |
-| `BK` | 64 | 64 | Tile size along K |
-| `NUM_STAGES` | 2, 3, 4 | 2, 3, 4 | Pipeline depth (bounded by shared memory) |
+| `BK` | 64 (bf16) / 128 (fp8) | 64 (bf16) / 128 (fp8) | Tile size along K |
+| `NUM_STAGES` | 2–5 | 2–5 | Pipeline depth (bounded by shared memory) |
 | `CWG` | 1, 2 | 1, 2 | Consumer warp groups (4 warps each) |
 | `WARP_M` | 16–128 | — | Per-warp tile along M (multiples of 16) |
 | `WARP_N` | 8–128 | — | Per-warp tile along N (multiples of 8) |
-| `SPLIT_K` | 1, 2 | 1, 2, 4, 8, 16 | K-dimension parallelism factor |
+| `SPLIT_K` | 1, 2 (bf16); 1 (fp8) | 1, 2, 4, 8, 16 | K-dimension parallelism factor |
 
-Constraint: `(BM / WARP_M) * (BN / WARP_N) == CWG * 4` (total consumer warps must tile the output block exactly). The tensor-core sweep enumerates 135 configurations within a 128 KB shared-memory budget; on a device with a 99 KB per-block limit, 122 of them are runnable, plus 50 tiny-M configurations (`BM` ∈ {4, 8}, `BN` ∈ {128, 256}, `SPLIT_K` up to 16).
+Constraint: `(BM / WARP_M) * (BN / WARP_N) == CWG * 4` (total consumer warps must tile the output block exactly). `BM` below 4 in the tiny-M family only ever matches `M` of 1 or 2, but at those shapes the padding rows are pure waste — measurably so, see the ncu notes below. `FP8GemmMMA` has no split-K epilogue, so fp8 tensor-core configs are pinned to `SPLIT_K=1`; tiny-M covers the skinny shapes that would want one. On a device with a 99 KB per-block limit the search space is 254 bf16 configurations and 177 fp8 ones.
 
 ## FP8 (e4m3), per-tensor scaling
 
-A harness, an FP32 reference, the cuBLASLt baseline, and a first-pass
-hand-written kernel (`FP8GemmMMA`). The kernel is correct everywhere but not
-yet tuned — see the table below.
+A harness, an FP32 reference, the cuBLASLt baseline, and two hand-written
+kernels: `FP8GemmMMA` (tensor cores) and `FP8GemmTinyM` (CUDA cores, M ≤ 8).
+
+`bench_fp8` has the same modes as `bench`, over the same JIT and autotune
+machinery — the only difference is the element type, which it fixes to e4m3:
 
 ```bash
-./bench_fp8                  # correctness + baseline + our kernel variants
+./bench_fp8                          # bench every shape in the autotune cache
+./bench_fp8 --autotune                # autotune the built-in shape list
+./bench_fp8 --shape M,N,K --autotune  # autotune one shape
+./bench_fp8 --shape M,N,K --config C  # compile, check and bench one config
+./bench_fp8 --list-configs            # print the configuration space
+```
+
+plus the fp8-specific diagnostics:
+
+```bash
 ./bench_fp8 --quant-error    # also report what fp8 quantization costs
 ./bench_fp8 --normal         # gaussian inputs (--outlier adds 1000x outliers)
 ./bench_fp8 --probe-layout   # verify the m16n8k32 fragment layout, then exit
 ```
+
+The winner per shape is cached in `autotune_cache_fp8.txt`, separately from the
+bf16 cache.
 
 Quantization model, per tensor:
 
@@ -185,11 +205,9 @@ Two things worth knowing before designing a kernel:
 
 ### The FP8 kernel
 
-`FP8GemmMMA` is the bf16 tensor-core kernel with the consumer swapped to
-`mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`. Everything else — the
-persistent CTAs, the producer warp group, the TMA/mbarrier pipeline, the warp
-tiling, the epilogue — is unchanged. Three consequences follow from that one
-swap:
+`FP8GemmMMA` is the bf16 tensor-core kernel with the consumer swapped to an
+fp8 MMA. Everything else — persistent CTAs, producer warp group, TMA/mbarrier
+pipeline, warp tiling, epilogue — is unchanged.
 
 | | fp8 `m16n8k32` | bf16 `m16n8k16` |
 |---|---|---|
@@ -198,20 +216,131 @@ swap:
 | C/D fragment | 4 x fp32 — **identical** | 4 x fp32 |
 | k per instruction | **32** | 16 |
 
-- `MMA_K = BK / 32`, and `BK` is pinned to **128**: the 128B swizzle wants a
-  128-byte smem row and an fp8 element is one byte. A pipeline stage therefore
-  costs the same shared memory as the bf16 kernel's `BK=64` while covering
-  twice the k.
-- Fragment **addressing is unchanged in bytes**. A register holds 4 bytes
-  either way, so the same `ldmatrix.b16` loaders work on fp8 reinterpreted as
-  b16 pairs; only the per-lane k offsets count elements instead
-  (`(lane>>4)*16` fp8 where bf16 used `(lane>>4)*8`).
-- The accumulator layout is identical, so the epilogue only gains the
-  dequantization scale, applied to the fp32 accumulator before narrowing.
+Because a register holds 4 bytes either way, fragment **addressing is
+unchanged in bytes** — the same `ldmatrix.b16` loaders work on fp8
+reinterpreted as b16 pairs; only per-lane k offsets count elements instead.
+`BK` is pinned to 128 so an smem row is 128 bytes for the swizzle. The exact
+per-lane layout is documented in `fp8_gemm.cuh` and checked by
+`--probe-layout`.
 
-The exact per-lane layout is documented at the top of `fp8_gemm.cuh` and is
-verified by `--probe-layout`, which runs a single MMA against a CPU dot
-product using small integers so both are exact.
+**The MMA is block-scaled.** The obvious instruction,
+`mma.m16n8k32...f32.e4m3.e4m3.f32`, runs at *half* the tensor-core issue rate
+on sm_120 — 350 TFLOPS against a 700 TFLOPS ceiling, and visible in ncu as a
+tensor pipe 97% busy while the HMMA subpipe sits at 48%. The block-scaled
+form runs at the full rate **and still accumulates in fp32**:
+
+| instruction | TFLOPS |
+|---|---|
+| `mma.m16n8k32` e4m3 -> f32 | 350 |
+| **`QMMA.SF` block-scaled -> f32** (what cuBLAS issues) | **700** |
+| `mma.m16n8k32` e4m3 -> f16 | 700 |
+
+So there is no reason to trade precision for speed here: block-scaling gets
+the same 2x that f16 accumulation would, with fp32 accumulate intact. **The
+entire 2x comes from the instruction itself, not from the scaling** — cuBLAS
+uses it exactly this way, feeding the MMA a neutral 2^0 scale (its SASS
+literally does `MOV R5, 0x7f7f7f7f`) and applying the real scale afterwards.
+
+The `ue8m0` scale operands only express powers of two, so an arbitrary
+per-tensor scale is split as `scale = m * 2^e`: the `2^e` rides along in the
+MMA for free and only the mantissa residual `m` reaches the epilogue as one
+multiply. Any positive scale is accepted. That multiply is free in practice —
+removing it entirely (by forcing a power-of-two scale) measured no faster,
+because 32 FMULs per output tile are nothing against the k-loop.
+
+Because all four scale bytes carry the same value under per-tensor scaling,
+the scale-fragment layout does not matter yet — real per-block scaling will
+have to pin it down.
+
+> **Build gotcha:** this instruction is architecture-specific.
+> `nvcc -arch=sm_120a` silently forwards `-arch=compute_120` to ptxas,
+> dropping the `a`, and the instruction is rejected. Both the CMake build and
+> `kernel_jit.h` therefore emit `-gencode arch=compute_120a,code=sm_120a`.
+
+### The FP8 tiny-M kernel
+
+`FP8GemmTinyM` is `BF16GemmTinyM` with the operand type swapped. The work
+decomposition, pipeline and epilogue are identical; three things move:
+
+- **`BK` 64 → 128**, so an smem row is still 128 bytes for the swizzle.
+- **`VEC` 8 → 16 elements.** What has to stay fixed is the *byte* width: 16-byte
+  accesses put eight consecutive `n` on eight distinct banks, covering all 32
+  exactly once. Sixteen fp8 is sixteen bytes, so only the element count changes.
+- **The widening is no longer free.** bf16 → f32 is a shift; e4m3 → f32 needs
+  `cvt.rn.f16x2.e4m3x2` then f16 → f32.
+
+That last point is the one that shows up in the numbers. Per k-chunk a thread
+converts `BM*VEC` X elements against `BM*NPT*VEC` FMAs, so the (fully redundant
+— every lane widens the same broadcast X) conversion cost is `1/NPT` of the FMA
+cost. At `NPT=1` it is roughly 1.5× the FMA count, and `BN=256/CWG=1` (`NPT=2`)
+measures **27% faster** than `BN=128/CWG=1` at K=14336.
+
+An ncu profile at M=1 (`--set full`, N=28672 K=4096) says the rest is simply
+memory:
+
+| | duration | DRAM | SM | L2 hit | warp cyc/inst |
+|---|---|---|---|---|---|
+| cuBLASLt `nvjet…64x32x64…bz_TNNN` | 106.3 µs | 65.0% | 10.1% | 50.1% | 25.2 |
+| `tinym_4x128x128_s4_cwg1_sk16` | 94.8 µs | **72.6%** | 38.0% | 3.4% | 5.0 |
+
+cuBLAS picks a 64×32×64 tile with split-k 4, so at M=1 **63 of every 64 A rows
+are padding** — hence its 50% L2 hit rate (re-reading the same padded tile) and
+stalls dominated by `long_scoreboard` 39.6% + `mio_throttle` 19.8%. It throttles
+its own memory pipes on work that produces nothing. Our 3.4% hit rate means W is
+fetched once and never touched again, and 117.4 MB in 94.8 µs is 1.24 TB/s of
+irreducible traffic.
+
+Our own padding waste is real but small — at M=1, `BM` 8 → 4 → 2 → 1 measures
+1144 → 1186 → 1217 → 1228 GB/s, with SM throughput falling from 60% to 38%.
+That is why the tiny-M sweep enumerates `BM` down to 1. Two remaining overheads
+the profile exposes: `splitk_reduce_kernel` costs **3.7% of total** (it writes
+1.83 MB of fp32 partials to DRAM and reads them back to produce 57 KB of
+output — an atomic epilogue would delete it), and `barrier` is 38% of stall
+cycles because 3 of 8 warps are the producer group's idle warps, parked at
+`__syncthreads()` while only lane 0 of warp 0 issues TMA.
+
+### FP8 results (RTX 5090, autotuned)
+
+Ours vs cuBLASLt, same run so clocks match. TFLOPS for the compute-bound
+shapes:
+
+| shape | cuBLASLt | ours | | config |
+|---|---|---|---|---|
+| 256^3 | 5.41 | 5.38 | 0.99x | `64x64x128_s3_cwg2_w64x8` |
+| 1024^3 | 168.9 | 184.0 | 1.09x | `64x128x128_s3_cwg2_w32x32` |
+| 4096^3 | 489.2 | 497.9 | 1.02x | `128x128x128_s2_cwg2_w64x32` |
+| 8192^3 | 454.5 | **624.9** | **1.37x** | `128x128x128_s2_cwg2_w32x64` |
+| 4096x28672x4096 | 435.4 | **614.8** | **1.41x** | `128x128x128_s2_cwg2_w32x64` |
+| 4096x4096x14336 | 427.3 | 540.6 | 1.27x | `128x128x128_s2_cwg2_w32x64` |
+| 128x28672x4096 | 217.0 | 294.3 | 1.36x | `128x64x128_s3_cwg1_w32x64` |
+| 128x4096x14336 | 212.5 | 261.6 | 1.23x | `64x64x128_s5_cwg2_w16x32` |
+
+624.9 is 89% of the 700 TFLOPS instruction ceiling.
+
+The decode-sized rows are bandwidth work, so GB/s is the yardstick:
+
+| shape | cuBLASLt | ours | | config |
+|---|---|---|---|---|
+| 8x28672x4096 | 1237 | 1117 | 0.90x | `tinym_8x256x128_s2_cwg1_sk16` |
+| 8x4096x14336 | 1092 | 1064 | 0.97x | `tinym_8x256x128_s2_cwg1_sk8` |
+| 4x28672x4096 | 1116 | 1223 | 1.10x | `tinym_4x128x128_s2_cwg1_sk2` |
+| 4x4096x14336 | 1116 | 1113 | 1.00x | `tinym_4x128x128_s3_cwg1_sk4` |
+| 1x28672x4096 | 1110 | **1248** | **1.12x** | `tinym_1x128x128_s3_cwg1_sk2` |
+| 1x4096x14336 | 1121 | 1148 | 1.02x | `tinym_1x128x128_s2_cwg1_sk8` |
+
+The two M=8 rows are the only shapes where cuBLASLt still wins. Note how little
+the winning split-K resembles a rule of thumb — `sk2` for M=4 at N=28672 but
+`sk8` for M=1 at N=4096 — which is the argument for autotuning rather than
+hand-picking.
+
+Known remaining inefficiency: our epilogue stages the tile through shared
+memory (`stmatrix` into `Y_out`, then a TMA store), costing ~1.9M
+shared-memory store bank conflicts per 4096^3 GEMM. cuBLAS has zero, but not
+because it swizzles `Y_out` better — its SASS shows 768 `STG` and zero
+`STS`/`STSM`, i.e. it skips shared memory in the epilogue entirely and stores
+straight to global. Dropping the smem staging would also free the `Y_out`
+buffer, which is what currently caps `128x128` at 2 pipeline stages; cuBLAS
+fits 6 stages of `128x128x64` in 96 KB precisely because it has no `Y_out`.
 
 ### cuBLASLt FP8 baseline (RTX 5090)
 

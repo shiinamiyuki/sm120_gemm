@@ -14,17 +14,31 @@
 
 using bf16 = __nv_bfloat16;
 
-// Function pointer type exported by each JIT-compiled kernel .so.
-// Uses void* for bf16 pointers to avoid C++ mangling issues in extern "C".
+// Function pointer types exported by each JIT-compiled kernel .so, one per
+// element type. Both use void* for the matrix pointers to avoid C++ mangling
+// issues in extern "C"; the fp8 form additionally carries the per-tensor
+// dequantization scales.
 using GemmKernelFn = void (*)(int M, int N, int K,
                               const void *X, const void *W, void *Y,
                               float *workspace, cudaStream_t stream);
+using Fp8GemmKernelFn = void (*)(int M, int N, int K,
+                                 const void *X, const void *W, void *Y,
+                                 float x_scale, float w_scale,
+                                 float *workspace, cudaStream_t stream);
 
 // Which kernel template a config instantiates. Both share the producer /
 // TMA / mbarrier pipeline and differ only in the consumer.
 enum class KernelFamily {
-    Mma,   // BF16GemmMMA      — tensor cores, requires M % BM == 0
-    TinyM, // BF16GemmTinyM    — CUDA cores, for M <= BM (skinny GEMM)
+    Mma,   // {BF16,FP8}GemmMMA   — tensor cores, requires M % BM == 0
+    TinyM, // {BF16,FP8}GemmTinyM — CUDA cores, for M <= BM (skinny GEMM)
+};
+
+// Operand element type. The two share every kernel template; what changes is
+// the element size (and everything derived from it: the smallest BK that fills
+// a 128-byte swizzled smem row, the MMA's k extent, the vector-load width).
+enum class ElemType {
+    Bf16,
+    Fp8, // e4m3
 };
 
 // ── GEMM configuration ─────────────────────────────────────────────────
@@ -44,27 +58,40 @@ enum class KernelFamily {
 //
 //     tinym_8x256x64_s2_cwg1_sk8
 //
+// FP8 configs carry a leading "fp8" token, before the family token:
+//
+//     fp8_128x128x128_s2_cwg2_w64x32_sk1
+//     fp8_tinym_4x256x128_s2_cwg1_sk16
+//
 // parse() accepts the tokens in any order and fills in defaults, so partial
 // specs work on the command line: "128x128", "128x128x64_sk2", "s4_cwg1_128x64",
-// "tinym_8x256".
+// "tinym_8x256", "fp8_128x128x128".
 struct GemmConfig {
     int bm = 0, bn = 0, bk = 64;
     int stages = 3, cwg = 2;
     int warp_m = 0, warp_n = 0; // 0 = derive from bm/bn/cwg (Mma only)
     int split_k = 1;
-    // Last member so the aggregate initialisers below keep working.
+    // Last members so the aggregate initialisers below keep working.
     KernelFamily family = KernelFamily::Mma;
+    ElemType elem = ElemType::Bf16;
 
     bool is_tiny_m() const { return family == KernelFamily::TinyM; }
+    bool is_fp8() const { return elem == ElemType::Fp8; }
+    int elem_bytes() const { return is_fp8() ? 1 : 2; }
+    // k covered by one MMA instruction: m16n8k16 for bf16, m16n8k32 for e4m3.
+    int mma_k() const { return is_fp8() ? 32 : 16; }
+    // Elements in one 16-byte smem vector load (tiny-M).
+    int vec() const { return 16 / elem_bytes(); }
 
     std::string name() const {
         char buf[128];
+        const char *dt = is_fp8() ? "fp8_" : "";
         if (is_tiny_m())
-            snprintf(buf, sizeof(buf), "tinym_%dx%dx%d_s%d_cwg%d_sk%d",
-                     bm, bn, bk, stages, cwg, split_k);
+            snprintf(buf, sizeof(buf), "%stinym_%dx%dx%d_s%d_cwg%d_sk%d",
+                     dt, bm, bn, bk, stages, cwg, split_k);
         else
-            snprintf(buf, sizeof(buf), "%dx%dx%d_s%d_cwg%d_w%dx%d_sk%d",
-                     bm, bn, bk, stages, cwg, warp_m, warp_n, split_k);
+            snprintf(buf, sizeof(buf), "%s%dx%dx%d_s%d_cwg%d_w%dx%d_sk%d",
+                     dt, bm, bn, bk, stages, cwg, warp_m, warp_n, split_k);
         return buf;
     }
 
@@ -87,15 +114,16 @@ struct GemmConfig {
         if (stages < 2) return fail("NUM_STAGES=%d must be >= 2 to pipeline", stages);
         if (cwg < 1) return fail("CWG=%d must be >= 1", cwg);
         if (split_k < 1) return fail("SPLIT_K=%d must be >= 1", split_k);
-        if (bk * (int)sizeof(bf16) < 128)
-            return fail("BK=%d gives a %zu-byte K row; 128B swizzle needs >= 128",
-                        bk, bk * sizeof(bf16));
+        if (bk * elem_bytes() < 128)
+            return fail("BK=%d gives a %d-byte K row; 128B swizzle needs >= 128",
+                        bk, bk * elem_bytes());
 
         if (is_tiny_m()) {
-            // Mirrors the static_asserts in BF16GemmTinyM.
+            // Mirrors the static_asserts in {BF16,FP8}GemmTinyM.
             if (bm > 256 || bn > 256 || bk > 256)
                 return fail("TMA box dims are capped at 256 (got %dx%dx%d)", bm, bn, bk);
-            if (bk % 8) return fail("BK=%d must be a multiple of 8 (16B vector loads)", bk);
+            if (bk % vec())
+                return fail("BK=%d must be a multiple of %d (16B vector loads)", bk, vec());
             if (bn % 8) return fail("BN=%d must be a multiple of 8 rows", bn);
             if (bn % consumer_threads())
                 return fail("BN=%d must be a multiple of the %d consumer threads",
@@ -106,9 +134,14 @@ struct GemmConfig {
             return {};
         }
 
+        // The fp8 MMA kernel has no split-k epilogue; tiny-M covers the skinny
+        // shapes that would want one.
+        if (is_fp8() && split_k != 1)
+            return fail("the fp8 MMA kernel has no split-k path (got sk%d)", split_k);
         if (bm % 16) return fail("BM=%d must be a multiple of 16 (mma.m16)", bm);
         if (bn % 8) return fail("BN=%d must be a multiple of 8 (mma.n8)", bn);
-        if (bk % 16) return fail("BK=%d must be a multiple of 16 (mma.k16)", bk);
+        if (bk % mma_k())
+            return fail("BK=%d must be a multiple of %d (mma.k%d)", bk, mma_k(), mma_k());
         if (warp_m <= 0 || warp_n <= 0)
             return fail("warp tile is unset (%dx%d)", warp_m, warp_n);
         if (warp_m % 16) return fail("WARP_M=%d must be a multiple of 16", warp_m);
@@ -136,14 +169,16 @@ struct GemmConfig {
     // is what gates a launch against the device shared-memory limit.
     size_t smem_bytes() const {
         size_t barriers = 2 * (size_t)stages * sizeof(uint64_t);
+        size_t esz = (size_t)elem_bytes();
         if (is_tiny_m()) {
             // The X stage stride is padded up to a whole 8-row (1024B) block
             // so every stage lands on the same 128B-swizzle phase.
             size_t x_rows = ((size_t)(bm + 7) / 8) * 8;
-            size_t tile = (size_t)stages * (x_rows * bk + (size_t)bk * bn) * sizeof(bf16);
+            size_t tile = (size_t)stages * (x_rows * bk + (size_t)bk * bn) * esz;
             return tile + barriers; // no smem Y staging: the epilogue goes direct
         }
-        size_t tile = (size_t)stages * (bm * bk + bk * bn) * sizeof(bf16);
+        size_t tile = (size_t)stages * (bm * bk + bk * bn) * esz;
+        // Y is bf16 whatever the operands are.
         size_t y_out = (split_k == 1) ? (size_t)bm * bn * sizeof(bf16) : 0;
         return tile + y_out + barriers;
     }
@@ -182,7 +217,7 @@ struct GemmConfig {
         }
 
         GemmConfig c{};
-        bool have_tile = false;
+        bool have_tile = false, have_bk = false;
         for (size_t start = 0; start <= s.size();) {
             size_t end = s.find('_', start);
             if (end == std::string_view::npos) end = s.size();
@@ -198,6 +233,10 @@ struct GemmConfig {
                 c.family = KernelFamily::TinyM;
             } else if (tok == "mma") {
                 c.family = KernelFamily::Mma;
+            } else if (tok == "fp8") {
+                c.elem = ElemType::Fp8;
+            } else if (tok == "bf16") {
+                c.elem = ElemType::Bf16;
             } else if (tok.rfind("sk", 0) == 0) {
                 if (!scan_tail(tok, 2, c.split_k)) return bad("sk<n>");
             } else if (tok.rfind("cwg", 0) == 0) {
@@ -213,7 +252,10 @@ struct GemmConfig {
                 if (n < 2) return bad("<BM>x<BN>[x<BK>]");
                 c.bm = d[0];
                 c.bn = d[1];
-                if (n == 3) c.bk = d[2];
+                if (n == 3) {
+                    c.bk = d[2];
+                    have_bk = true;
+                }
                 have_tile = true;
             } else {
                 return set_err("unknown token '" + std::string(tok) + "' in config '" +
@@ -223,6 +265,10 @@ struct GemmConfig {
 
         if (!have_tile)
             return set_err("config '" + std::string(s) + "' has no BMxBN tile");
+        // The default BK is whatever fills a 128-byte swizzled smem row, which
+        // depends on the element size — so it can only be applied once the whole
+        // token list has been seen (tokens may appear in any order).
+        if (!have_bk) c.bk = 128 / c.elem_bytes();
         if (c.is_tiny_m()) {
             if (c.warp_m || c.warp_n)
                 return set_err("config '" + std::string(s) +
@@ -240,24 +286,29 @@ struct GemmConfig {
     // Both families are enumerated; fits_shape() then keeps tiny-M configs out
     // of the running for anything but M <= BM, so a large-M autotune never
     // pays to compile them.
-    static std::vector<GemmConfig> enumerate(size_t max_smem) {
-        std::vector<GemmConfig> out = enumerate_mma(max_smem);
-        for (auto &c : enumerate_tiny_m(max_smem)) out.push_back(c);
+    static std::vector<GemmConfig> enumerate(size_t max_smem, ElemType elem = ElemType::Bf16) {
+        std::vector<GemmConfig> out = enumerate_mma(max_smem, elem);
+        for (auto &c : enumerate_tiny_m(max_smem, elem)) out.push_back(c);
         return out;
     }
 
     // Tiny-M leans on split-K far harder than the tensor-core family: with no
-    // M-parallelism, N/BN tiles alone leave most SMs idle.
-    static std::vector<GemmConfig> enumerate_tiny_m(size_t max_smem) {
+    // M-parallelism, N/BN tiles alone leave most SMs idle. BM below 4 only ever
+    // matches M=1 or 2, but at those shapes the padding rows are pure waste —
+    // measurably so, see the ncu notes in README.
+    static std::vector<GemmConfig> enumerate_tiny_m(size_t max_smem,
+                                                    ElemType elem = ElemType::Bf16) {
+        const int bk0 = 128 / (elem == ElemType::Fp8 ? 1 : 2);
         std::vector<GemmConfig> out;
-        for (int bm : {4, 8})
+        for (int bm : {1, 2, 4, 8})
             for (int bn : {128, 256})
-                for (int bk : {64})
+                for (int bk : {bk0})
                     for (int cwg : {1, 2})
                         for (int sk : {1, 2, 4, 8, 16})
-                            for (int stages : {4, 3, 2}) {
+                            for (int stages : {5, 4, 3, 2}) {
                                 GemmConfig c{};
                                 c.family = KernelFamily::TinyM;
+                                c.elem = elem;
                                 c.bm = bm;
                                 c.bn = bn;
                                 c.bk = bk;
@@ -271,19 +322,24 @@ struct GemmConfig {
         return out;
     }
 
-    static std::vector<GemmConfig> enumerate_mma(size_t max_smem) {
+    static std::vector<GemmConfig> enumerate_mma(size_t max_smem,
+                                                 ElemType elem = ElemType::Bf16) {
+        const bool fp8 = elem == ElemType::Fp8;
+        const int bk0 = fp8 ? 128 : 64; // BK*elem_bytes must be >= SWIZZLE_128B
         std::vector<GemmConfig> out;
         for (int bm : {64, 128})
             for (int bn : {64, 128})
-                for (int bk : {64}) // BK*sizeof(bf16) must be >= SWIZZLE_128B
+                for (int bk : {bk0})
                     for (int cwg : {1, 2})
-                        for (int sk : {1, 2})
-                            for (int stages : {4, 3, 2})
+                        // The fp8 MMA kernel has no split-k epilogue.
+                        for (int sk : (fp8 ? std::vector<int>{1} : std::vector<int>{1, 2}))
+                            for (int stages : {5, 4, 3, 2})
                                 for (int wm = 16; wm <= bm; wm += 16) {
                                     if (bm % wm) continue;
                                     for (int wn = 8; wn <= bn; wn += 8) {
                                         if (bn % wn) continue;
-                                        GemmConfig c{bm, bn, bk, stages, cwg, wm, wn, sk};
+                                        GemmConfig c{bm, bn, bk, stages, cwg, wm, wn, sk,
+                                                     KernelFamily::Mma, elem};
                                         if (!c.validate().empty()) continue;
                                         if (c.smem_bytes() > max_smem) continue;
                                         out.push_back(c);
