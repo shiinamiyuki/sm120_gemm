@@ -25,6 +25,12 @@ using Fp8GemmKernelFn = void (*)(int M, int N, int K,
                                  const void *X, const void *W, void *Y,
                                  float x_scale, float w_scale,
                                  float *workspace, cudaStream_t stream);
+// MXFP8 carries block-scale *tensors* instead of two scalars; they are the
+// swizzled ue8m0 layout described in mxfp8_scale.h.
+using MxFp8GemmKernelFn = void (*)(int M, int N, int K,
+                                   const void *X, const void *W, void *Y,
+                                   const void *x_sf, const void *w_sf,
+                                   float *workspace, cudaStream_t stream);
 
 // Which kernel template a config instantiates. Both share the producer /
 // TMA / mbarrier pipeline and differ only in the consumer.
@@ -38,7 +44,8 @@ enum class KernelFamily {
 // a 128-byte swizzled smem row, the MMA's k extent, the vector-load width).
 enum class ElemType {
     Bf16,
-    Fp8, // e4m3
+    Fp8,   // e4m3, one scale for the whole tensor
+    MxFp8, // e4m3, one ue8m0 scale per 32 elements along K (OCP microscaling)
 };
 
 // ── GEMM configuration ─────────────────────────────────────────────────
@@ -76,7 +83,11 @@ struct GemmConfig {
     ElemType elem = ElemType::Bf16;
 
     bool is_tiny_m() const { return family == KernelFamily::TinyM; }
-    bool is_fp8() const { return elem == ElemType::Fp8; }
+    // Both fp8 flavours store e4m3, so everything the element size implies —
+    // BK, the MMA k-extent, the vector width — is shared. Only where the
+    // scale comes from differs.
+    bool is_fp8() const { return elem == ElemType::Fp8 || elem == ElemType::MxFp8; }
+    bool is_mx() const { return elem == ElemType::MxFp8; }
     int elem_bytes() const { return is_fp8() ? 1 : 2; }
     // k covered by one MMA instruction: m16n8k16 for bf16, m16n8k32 for e4m3.
     int mma_k() const { return is_fp8() ? 32 : 16; }
@@ -85,7 +96,7 @@ struct GemmConfig {
 
     std::string name() const {
         char buf[128];
-        const char *dt = is_fp8() ? "fp8_" : "";
+        const char *dt = is_mx() ? "mxfp8_" : is_fp8() ? "fp8_" : "";
         if (is_tiny_m())
             snprintf(buf, sizeof(buf), "%stinym_%dx%dx%d_s%d_cwg%d_sk%d",
                      dt, bm, bn, bk, stages, cwg, split_k);
@@ -178,6 +189,13 @@ struct GemmConfig {
             return tile + barriers; // no smem Y staging: the epilogue goes direct
         }
         size_t tile = (size_t)stages * (bm * bk + bk * bn) * esz;
+        // MXFP8 also stages the ue8m0 scale tiles: SF_PACKS = bk/128 per stage,
+        // and one 512-byte tile per 128 rows of each operand.
+        if (is_mx()) {
+            size_t packs = (size_t)bk / 128;
+            size_t x_tiles = ((size_t)bm + 127) / 128, w_tiles = ((size_t)bn + 127) / 128;
+            tile += (size_t)stages * packs * (x_tiles + w_tiles) * 512;
+        }
         // Y is bf16 whatever the operands are.
         size_t y_out = (split_k == 1) ? (size_t)bm * bn * sizeof(bf16) : 0;
         return tile + y_out + barriers;
@@ -235,6 +253,8 @@ struct GemmConfig {
                 c.family = KernelFamily::Mma;
             } else if (tok == "fp8") {
                 c.elem = ElemType::Fp8;
+            } else if (tok == "mxfp8") {
+                c.elem = ElemType::MxFp8;
             } else if (tok == "bf16") {
                 c.elem = ElemType::Bf16;
             } else if (tok.rfind("sk", 0) == 0) {
@@ -298,7 +318,7 @@ struct GemmConfig {
     // measurably so, see the ncu notes in README.
     static std::vector<GemmConfig> enumerate_tiny_m(size_t max_smem,
                                                     ElemType elem = ElemType::Bf16) {
-        const int bk0 = 128 / (elem == ElemType::Fp8 ? 1 : 2);
+        const int bk0 = elem == ElemType::Bf16 ? 64 : 128;
         std::vector<GemmConfig> out;
         for (int bm : {1, 2, 4, 8})
             for (int bn : {128, 256})
@@ -324,7 +344,7 @@ struct GemmConfig {
 
     static std::vector<GemmConfig> enumerate_mma(size_t max_smem,
                                                  ElemType elem = ElemType::Bf16) {
-        const bool fp8 = elem == ElemType::Fp8;
+        const bool fp8 = elem != ElemType::Bf16;
         const int bk0 = fp8 ? 128 : 64; // BK*elem_bytes must be >= SWIZZLE_128B
         std::vector<GemmConfig> out;
         for (int bm : {64, 128})

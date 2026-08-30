@@ -45,6 +45,18 @@ inline JitOptions fp8_jit_options() {
     return o;
 }
 
+// MXFP8 kernels are their own translation unit again: the exported gemm_run
+// takes scale *tensors* rather than two scalars.
+inline JitOptions mxfp8_jit_options() {
+    JitOptions o;
+    o.entry = "mxfp8_kernel_entry.cu";
+    o.fingerprint_sources = {"mxfp8_kernel_entry.cu", "mxfp8_gemm.cuh",
+                             "mxfp8_gemm_tinym.cuh", "mxfp8_mma.cuh", "mxfp8_scale.h",
+                             "fp8_gemm_tinym.cuh", "fp8_gemm.cuh",
+                             "bf16_gemm.cuh", "common.h"};
+    return o;
+}
+
 template <class Fn>
 struct CompiledKernelT {
     GemmConfig config;
@@ -319,3 +331,5 @@ using KernelJit = KernelJitT<GemmKernelFn>;
 using CompiledKernel = CompiledKernelT<GemmKernelFn>;
 using Fp8KernelJit = KernelJitT<Fp8GemmKernelFn>;
 using Fp8CompiledKernel = CompiledKernelT<Fp8GemmKernelFn>;
+using MxFp8KernelJit = KernelJitT<MxFp8GemmKernelFn>;
+using MxFp8CompiledKernel = CompiledKernelT<MxFp8GemmKernelFn>;

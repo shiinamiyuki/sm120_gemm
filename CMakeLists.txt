@@ -84,3 +84,27 @@ target_link_libraries(bench_fp8 PRIVATE
     CUDA::cublasLt
     dl
 )
+
+# MXFP8 (OCP microscaling) baseline: cuBLASLt with VEC32_UE8M0 block scaling,
+# plus the probe that pins down the scale-factor tensor layout it expects.
+add_executable(bench_mxfp8 src/bench_mxfp8.cu)
+
+target_compile_options(bench_mxfp8 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --ptxas-options=-warn-spills>
+)
+
+target_compile_definitions(bench_mxfp8 PRIVATE
+    GEMM_NVCC="${CMAKE_CUDA_COMPILER}"
+    GEMM_SRC_DIR="${CMAKE_SOURCE_DIR}/src"
+    GEMM_JIT_CACHE_DIR="${KERNEL_JIT_CACHE_DIR}"
+    GEMM_CUDA_STUB_DIR="${CUDAToolkit_LIBRARY_DIR}/stubs"
+    GEMM_CUDA_ARCH="${GEMM_CUDA_ARCH}"
+)
+
+target_link_libraries(bench_mxfp8 PRIVATE
+    CUDA::cudart
+    CUDA::cuda_driver
+    CUDA::cublas
+    CUDA::cublasLt
+    dl
+)
