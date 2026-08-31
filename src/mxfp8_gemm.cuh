@@ -1,7 +1,7 @@
 #pragma once
 #include "fp8_gemm.cuh" // TMA / mbarrier / ldmatrix / stmatrix / swizzle helpers
 #include "mxfp8_mma.cuh"
-#include "mxfp8_scale.h"
+#include "block_scale.h"
 
 // ════════════════════════════════════════════════════════════════════════
 // MXFP8GemmMMA — MXFP8 GEMM on tensor cores
@@ -148,7 +148,7 @@ __global__ void __launch_bounds__(MXFP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP
     mxfp8_gemm_mma_kernel(
         int M, int N, int K,
         int num_tiles_m, int num_tiles_n, int total_tiles,
-        int sf_k_tiles, // MxScaleLayout::k_tiles(), same for X and W
+        int sf_k_tiles, // BlockScaleLayout::k_tiles(), same for X and W
         __grid_constant__ const TMADescriptor tma_X,
         __grid_constant__ const TMADescriptor tma_W,
         __grid_constant__ const TMADescriptor tma_Y,
@@ -414,7 +414,7 @@ void MXFP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N>::run(
     int num_tiles_m = M / BM;
     int num_tiles_n = N / BN;
     int total_tiles = num_tiles_m * num_tiles_n;
-    int sf_k_tiles = MxScaleLayout(M, K).k_tiles();
+    int sf_k_tiles = BlockScaleLayout(M, K).k_tiles();
 
     int num_sm = 0;
     CHECK_CUDA(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, 0));

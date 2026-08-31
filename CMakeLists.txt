@@ -108,3 +108,64 @@ target_link_libraries(bench_mxfp8 PRIVATE
     CUDA::cublasLt
     dl
 )
+
+# W4A16: bf16 activations x NVFP4 weights. No cuBLASLt path exists for mixed
+# widths, so the baseline here is the bf16 GEMM it replaces.
+add_executable(bench_w4a16 src/bench_w4a16.cu)
+
+target_compile_options(bench_w4a16 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --ptxas-options=-warn-spills>
+)
+
+target_compile_definitions(bench_w4a16 PRIVATE
+    GEMM_NVCC="${CMAKE_CUDA_COMPILER}"
+    GEMM_SRC_DIR="${CMAKE_SOURCE_DIR}/src"
+    GEMM_JIT_CACHE_DIR="${KERNEL_JIT_CACHE_DIR}"
+    GEMM_CUDA_STUB_DIR="${CUDAToolkit_LIBRARY_DIR}/stubs"
+    GEMM_CUDA_ARCH="${GEMM_CUDA_ARCH}"
+)
+
+target_link_libraries(bench_w4a16 PRIVATE
+    CUDA::cudart
+    CUDA::cuda_driver
+    CUDA::cublas
+    CUDA::cublasLt
+    dl
+)
+
+# Device memory bandwidth, by access path. Provides the denominator for every
+# "% of peak" claim about the GEMM kernels -- the spec-sheet number is not it.
+add_executable(bench_bandwidth src/bench_bandwidth.cu)
+
+target_compile_options(bench_bandwidth PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+)
+
+target_link_libraries(bench_bandwidth PRIVATE
+    CUDA::cudart
+    CUDA::cuda_driver
+)
+
+# W4A4: NVFP4 activations x NVFP4 weights. sm_120a has a native block-scaled
+# e2m1 MMA, so this family needs no dequantize step -- but the operand and
+# scale fragment layouts have to be probed before a kernel can use it.
+add_executable(bench_w4a4 src/bench_w4a4.cu)
+
+target_compile_options(bench_w4a4 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --ptxas-options=-warn-spills>
+)
+
+target_compile_definitions(bench_w4a4 PRIVATE
+    GEMM_NVCC="${CMAKE_CUDA_COMPILER}"
+    GEMM_SRC_DIR="${CMAKE_SOURCE_DIR}/src"
+    GEMM_JIT_CACHE_DIR="${KERNEL_JIT_CACHE_DIR}"
+    GEMM_CUDA_STUB_DIR="${CUDAToolkit_LIBRARY_DIR}/stubs"
+    GEMM_CUDA_ARCH="${GEMM_CUDA_ARCH}"
+)
+
+target_link_libraries(bench_w4a4 PRIVATE
+    CUDA::cudart
+    CUDA::cuda_driver
+    CUDA::cublas
+    dl
+)

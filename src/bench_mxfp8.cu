@@ -161,7 +161,7 @@ static bool parse_args(int argc, char **argv, Args &a) {
 
 // ── Scale-factor layout probe ──────────────────────────────────────────
 //
-// MxScaleLayout::offset() was reverse-engineered, not documented, so it is
+// BlockScaleLayout::offset() was reverse-engineered, not documented, so it is
 // worth re-deriving whenever the toolkit changes. The trick: rig the data so
 // that Y[m][n] reads out one scale byte directly, then recover the buffer
 // index that byte came from one bit at a time.
@@ -177,7 +177,7 @@ static bool parse_args(int argc, char **argv, Args &a) {
 // a mismatch rather than reading out of bounds.
 static int probe_scale_layout(cudaStream_t stream) {
     const int M = 256, N = 256, K = 256, sk = K / 32;
-    MxScaleLayout LX(M, K), LW(N, K);
+    BlockScaleLayout LX(M, K), LW(N, K);
     const size_t alloc = std::max(LX.bytes(), LW.bytes()) * 4;
     int nbits = 0;
     while ((size_t)1 << nbits < alloc) nbits++;
@@ -204,7 +204,7 @@ static int probe_scale_layout(cudaStream_t stream) {
 
     int bad = 0;
     for (int which = 0; which < 2; which++) { // 0 = B scale (X), 1 = A scale (W)
-        const MxScaleLayout &L = which ? LW : LX;
+        const BlockScaleLayout &L = which ? LW : LX;
         CUDABuffer<unsigned char> &probed = which ? dsW : dsX;
         CUDABuffer<unsigned char> &other = which ? dsX : dsW;
         for (int kb0 = 0; kb0 < sk; kb0++) {
@@ -237,7 +237,7 @@ static int probe_scale_layout(cudaStream_t stream) {
                 if ((size_t)idx[r] != L.offset(r, kb0)) {
                     if (bad < 8)
                         printf("  %s-scale (row=%d, kb=%d): cuBLASLt reads byte %lld, "
-                               "MxScaleLayout predicts %zu\n",
+                               "BlockScaleLayout predicts %zu\n",
                                which ? "A" : "B", r, kb0, idx[r], L.offset(r, kb0));
                     bad++;
                 }

@@ -46,6 +46,25 @@ src/
   fp8_harness.h        # FP8 quantization model, FP32 reference kernels,
                        # accuracy metrics, Fp8Problem
   bench_fp8.cu         # FP8 command line and the bench/autotune modes
+  w4a16_gemm_tinym.cuh    # W4A16 (bf16 x NVFP4) CUDA-core kernel, M <= BM
+  w4a16_gemm_tinym_tc.cuh # W4A16 tensor-core kernel, mma.m16n8k16, BM = 16
+  w4a16_kernel_entry.cu   # JIT translation unit for both W4A16 families
+  w4a16_harness.h         # NVFP4 quantization, references, correctness
+  bench_w4a16.cu          # W4A16 command line and the bench/autotune modes
+  block_scale.h           # OCP microscaling layouts (ue8m0 / ue4m3 tiles),
+                          # cp_async_bulk_g2s
+  nvfp4_mma.cuh           # The native NVFP4 block-scaled m16n8k64 MMA and its
+                          # probed operand / scale fragment layouts (W4A4)
+  w4a4_gemm.cuh           # W4A4 (NVFP4 x NVFP4) tensor-core kernel: the native
+                          # block-scaled m16n8k64 MMA, no dequantize step
+  w4a4_harness.h          # W4A4: NVFP4 quantization of both operands, the
+                          # exact fp32 reference, swizzle self-check
+  bench_w4a4.cu           # W4A4: MMA layout probe, harness self-check, and a
+                          # direct kernel test (no JIT/autotune yet)
+  bench_bandwidth.cu      # Device memory bandwidth by access path -- the
+                          # denominator for every "% of peak" claim here
+bench/
+  compare_flashinfer.py   # FlashInfer's dense 4-bit GEMM on the same shapes
 ```
 
 ## Requirements
@@ -121,7 +140,16 @@ Configs come in two families, both sharing the producer / TMA / mbarrier pipelin
 tinym_8x256x64_s2_cwg1_sk8         CUDA cores  (BF16GemmTinyM),  for M <= BM
 fp8_128x128x128_s2_cwg2_w64x32     tensor cores (FP8GemmMMA)
 fp8_tinym_4x256x128_s2_cwg1_sk16   CUDA cores  (FP8GemmTinyM)
+w4a16_tinym_4x256x256_s2_cwg1_sk8  CUDA cores  (W4A16GemmTinyM)
+w4a16_tinymtc_16x256x256_s2_cwg2_sk8   tensor cores (W4A16GemmTinyMTC), BM = 16
+w4a4_128x128x256_s2_cwg2_w64x32_ys2_sk1  tensor cores (W4A4GemmMMA)
 ```
+
+The 4-bit families pin `BK` to 256: a BK-wide row of packed e2m1 is BK/2 bytes
+and the 128B swizzle needs 128 of them. W4A4 carries one extra knob, `ys`, the
+number of column slices its epilogue stores in — with both operands packed, a
+full `BM x BN` bf16 output staging buffer becomes the largest single thing in
+shared memory, and slicing it is what lets `BM=BN=128` fit at all.
 
 The element type changes everything derived from the element size: the smallest `BK` that fills a 128-byte swizzled smem row (64 for bf16, 128 for fp8), the MMA's k extent (16 vs 32), and the tiny-M vector-load width (8 vs 16 elements — the *byte* width stays 16). The default `BK` follows from it, so `--config 128x128` means `BK=64` under `bench` and `BK=128` under `bench_fp8`.
 
@@ -355,6 +383,156 @@ fits 6 stages of `128x128x64` in 96 KB precisely because it has no `Y_out`.
 | 128×4096×14336 | 264 | 1082 | 1.9× |
 
 The M=128 rows are bandwidth-bound (~1.05 TB/s), not compute-bound.
+
+## W4A16: bf16 activations x NVFP4 weights
+
+`bench_w4a16`. Weights are NVFP4 (e2m1 + one ue4m3 per 16 elements + an fp32
+global scale), activations stay bf16. Neither cuBLASLt nor the tensor cores do
+mixed 4-bit x 16-bit natively -- a sweep of 3072 cuBLASLt type combinations
+(`--probe-support`) finds no mixed-width matmul at all -- so the baseline is the
+bf16 cuBLAS GEMM this replaces.
+
+Two families, and the autotuner picks between them per shape:
+
+```
+w4a16_tinym_4x256x256_s2_cwg1_sk8      CUDA cores, one thread owns BM rows x NPT cols
+w4a16_tinymtc_16x256x256_s2_cwg2_sk8   tensor cores, mma.m16n8k16, BM pinned at 16
+```
+
+The tensor-core family dequantises W into B fragments **in registers** -- no bf16
+staging buffer. The fragment ldmatrix would have produced is, per lane, exactly
+two bytes of packed e2m1 lying inside one 16-element scale block, and the
+existing 128B TMA swizzle makes those two reads conflict-free. See
+`w4a16_gemm_tinym_tc.cuh`.
+
+### W4A16 results (RTX 5090, M <= 8 decode shapes)
+
+Timed under `GEMM_BENCH_GRAPH=1` (CUDA graph, back-to-back, best-of), which is
+the only mode comparable to anything driven from Python. FlashInfer's `mm_fp4`
+is the closest available dense 4-bit baseline; it is W4A4, so it moves ~0.5%
+fewer bytes and carries a weaker numerical contract. Reproduce with
+`python bench/compare_flashinfer.py`.
+
+| M, N, K | family | ours (ms) | GB/s | FlashInfer cuDNN (ms) |
+|---|---|---|---|---|
+| 1, 4096, 14336 | tinym | 0.0206 | 1609 | 0.0261 |
+| 1, 28672, 4096 | tinym | 0.0385 | 1718 | 0.0451 |
+| 4, 4096, 14336 | tinym | 0.0235 | 1409 | 0.0261 |
+| 4, 28672, 4096 | tinym | 0.0407 | 1629 | 0.0590 |
+| 8, 4096, 14336 | **tinymtc** | 0.0247 | 1350 | 0.0259 |
+| 8, 28672, 4096 | **tinymtc** | 0.0446 | 1492 | 0.0454 |
+
+Faster than FlashInfer on all six. The crossover between the families sits at
+M ~= 5-6: the CUDA-core kernel spends `BM` FMAs per weight element so its cost
+grows with M (0.0225 -> 0.0253 -> 0.0359 for M = 1, 4, 8), while the
+tensor-core kernel is flat (0.0261 -> 0.0264 -> 0.0262) because an m16 tile
+costs the same whether one row is live or sixteen. Neither family dominates:
+tinymtc wastes 15/16 of every MMA at M=1 and loses there by 16%.
+
+### What the remaining gap is, and is not
+
+The 79% of peak at M=8 N=4096 K=14336 is **not** an inefficient mainloop. Hold
+the config and grow K:
+
+| K | ms | GB/s |
+|---|---|---|
+| 14336 | 0.0245 | 1359 |
+| 28672 | 0.0428 | 1556 |
+| 57344 | 0.0902 | 1476 |
+| 114688 | 0.1729 | 1539 |
+
+Steady state is ~1500-1550 GB/s, ~91% of this card's 1707 GB/s measured read
+wall. The decode shape gives up ~13% to costs that do not scale with K -- TMA
+pipeline fill and drain, plus the split-k reduce launch after every call -- and
+a 25-microsecond kernel cannot amortise them. Three attacks on the mainloop all
+came back empty (split-k values dividing the k-tile count, smaller BN to shrink
+the split-k workspace, a cheaper dequantise); the notes in
+`w4a16_gemm_tinym_tc.cuh` record why each failed. The remaining lever is the
+fixed cost: folding the split-k reduction into the GEMM would remove a kernel
+launch per call.
+
+## W4A4: NVFP4 activations x NVFP4 weights
+
+`bench_w4a4`. Both operands NVFP4 (e2m1 + one ue4m3 per 16 elements of K + an
+fp32 global). Unlike W4A16 this has a native instruction on sm_120a --
+
+```
+mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X
+    .m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
+```
+
+-- so packed e2m1 goes straight into the tensor core and the per-16 scales are
+applied by the instruction itself. There is no dequantize step anywhere in the
+mainloop: the consumer is ldmatrix, ldmatrix, mma. `scale_vec::4X` gives four
+ue4m3 per row per MMA, one per 16 k, which is exactly NVFP4's block size and
+exactly one b32 -- so each MMA consumes a whole scale pack and the byte-id
+immediate is pinned to 0, the opposite of MXFP8's 1X form where one b32 fed
+four consecutive MMAs.
+
+The operand and scale fragment layouts were probed against the hardware rather
+than assumed; `bench_w4a4 --probe-mma` re-derives them and checks them against
+what `src/nvfp4_mma.cuh` documents, and `--selfcheck` verifies the swizzled
+scale tensors a kernel is handed decode identically to the row-major ones the
+fp32 reference uses. Both probes are deliberately falsifiable — perturbing the
+lane mapping or shifting a swizzled read by one k-block makes them fail loudly.
+
+### W4A4 results (RTX 5090, autotuned)
+
+Against FlashInfer's `mm_fp4`, which is the same operation with the same
+numerical contract — this comparison is exact, unlike the W4A16 one above.
+Both sides are timed the same way: CUDA graph, back-to-back, best-of, cycling
+operand sets past 2x L2. Ours with `GEMM_BENCH_GRAPH=1`, theirs with
+`python bench/compare_flashinfer.py --shape M,N,K`.
+
+| M, N, K | our config | ours | FlashInfer best | |
+|---|---|---|---|---|
+| 1024, 1024, 2048 | `128x64x256_s3_cwg1_w64x32_ys4` | **528** | 461 (b12x) | ours 1.15x |
+| 2048, 2048, 4096 | `128x128x256_s2_cwg1_w64x64_ys4` | 902 | **1129** (cudnn) | theirs 1.25x |
+| 4096, 4096, 4096 | `128x128x256_s2_cwg1_w64x64_ys4` | 1199 | **1289** (cudnn) | theirs 1.08x |
+
+TFLOPS. We win the small shape and lose the large ones, though the gap closes
+to 8% by 4096^3 — a fair place for a first working kernel, and the opposite of
+the decode-shaped W4A16 picture where we lead everywhere. cuDNN's 1289 is ~77%
+of this part's nominal dense FP4 rate against our ~71%, so the headroom is real
+but not enormous.
+
+Timing mode matters more here than anywhere else in this repo: the same
+autotuned configs report 419 / 824 / 940 TFLOPS under the default `bench_ms`
+(mean, with a 100 ms gap before each call) and 528 / 902 / 1199 under
+`GEMM_BENCH_GRAPH=1`. Compare like with like or the conclusion inverts.
+
+Note the tile crossover, and that it is the autotuner's job: at 1024 the
+128x128 config is *slower* than 128x64 (336 vs 399 TFLOPS in a hand-run sweep)
+because 8x8 tiles cannot cover 170 SMs, while at 2048 and up it wins by 1.25x.
+Bigger tiles are a trade against how many CTAs the shape can produce, not a
+free win.
+
+### Where the remaining gap is: the tail, not the mainloop
+
+One output tile per CTA and `num_blocks` capped at the SM count means the
+kernel takes `ceil(tiles / 170)` rounds however empty the last one is. Holding
+the config fixed at K=4096 and sweeping M=N:
+
+| M=N | tiles | rounds | TFLOPS |
+|---|---|---|---|
+| 1024 | 64 | 1 | 481 |
+| 1280 | 100 | 1 | 735 |
+| 1536 | 144 | 1 | 984 |
+| 1792 | 196 | 2 | **726** |
+| 2048 | 256 | 2 | 906 |
+| 2560 | 400 | 3 | 971 |
+| 3072 | 576 | 4 | 1113 |
+| 4096 | 1024 | 7 | 1192 |
+
+1792 against 1536 is the whole story: a 36% bigger GEMM that runs 26% *slower*,
+because 196 tiles need two rounds where 144 needed one. That sawtooth is also
+the entire FlashInfer gap — 25% behind at 2048, only 8% at 4096, where seven
+rounds amortise the ragged one.
+
+Tile tuning cannot fix it, because every tile shape that keeps the mainloop
+fast quantizes the same way at 2048. The fix is a stream-k schedule: split the
+total k-work evenly across exactly 170 CTAs and reduce the partial tiles, so
+throughput stops depending on how the tile count divides the SM count.
 
 ## Results (RTX 5090)
 

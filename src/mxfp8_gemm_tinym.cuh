@@ -1,6 +1,6 @@
 #pragma once
 #include "fp8_gemm_tinym.cuh" // fp8e4m3, TMA/mbarrier helpers, load_fp8x16_f32
-#include "mxfp8_scale.h"
+#include "block_scale.h"
 
 // ════════════════════════════════════════════════════════════════════════
 // MXFP8GemmTinyM — skinny MXFP8 GEMM (M <= BM, typically M <= 8) on CUDA cores
@@ -117,8 +117,8 @@ struct MXFP8GemmTinyM
 
     static constexpr int SMEM_SIZE = sizeof(SMemStorage);
 
-    // x_sf / w_sf are swizzled ue8m0 tensors laid out by MxScaleLayout(M, K)
-    // and MxScaleLayout(N, K); workspace must hold >= SPLIT_K * M * N floats.
+    // x_sf / w_sf are swizzled ue8m0 tensors laid out by BlockScaleLayout(M, K)
+    // and BlockScaleLayout(N, K); workspace must hold >= SPLIT_K * M * N floats.
     static void run(
         int M, int N, int K,
         const fp8e4m3 *__restrict__ X,
@@ -136,7 +136,7 @@ __global__ void __launch_bounds__(MXFP8GemmTinyM<BM, BN, BK, NUM_STAGES, CWG, SP
         int M, int N, int K,
         int num_tiles_m, int num_tiles_n, int total_tiles,
         int num_k_per_split,
-        int sf_k_tiles, // MxScaleLayout::k_tiles(), same for X and W
+        int sf_k_tiles, // BlockScaleLayout::k_tiles(), same for X and W
         __grid_constant__ const TMADescriptor tma_X,
         __grid_constant__ const TMADescriptor tma_W,
         const unsigned char *__restrict__ x_sf,
@@ -385,7 +385,7 @@ void MXFP8GemmTinyM<BM, BN, BK, NUM_STAGES, CWG, SPLIT_K>::run(
     int total_tiles = num_tiles_m * num_tiles_n;
     int num_k_per_split = (K / BK) / SPLIT_K;
     // BK = 128 = 4 * 32, so a stage index is exactly a scale-tile index.
-    int sf_k_tiles = MxScaleLayout(M, K).k_tiles();
+    int sf_k_tiles = BlockScaleLayout(M, K).k_tiles();
 
     int num_sm = 0;
     CHECK_CUDA(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, 0));

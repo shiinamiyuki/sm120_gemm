@@ -131,8 +131,8 @@ public:
     int N() const { return N_; }
     int K() const { return K_; }
     int sk() const { return sk_; }
-    const MxScaleLayout &x_layout() const { return lx_; }
-    const MxScaleLayout &w_layout() const { return lw_; }
+    const BlockScaleLayout &x_layout() const { return lx_; }
+    const BlockScaleLayout &w_layout() const { return lw_; }
     float *workspace() const { return workspace_.data; }
     const void *x_sf() const { return sfX_.data; }
     const void *w_sf() const { return sfW_.data; }
@@ -245,7 +245,7 @@ private:
         return accuracy(deq.data(), src.data(), src.size());
     }
 
-    void upload_swizzled(const std::vector<unsigned char> &codes, const MxScaleLayout &L,
+    void upload_swizzled(const std::vector<unsigned char> &codes, const BlockScaleLayout &L,
                          CUDABuffer<unsigned char> &dst) {
         std::vector<unsigned char> sw(L.bytes(), kUe8m0One); // padding decodes to 1.0
         for (int r = 0; r < L.rows; r++)
@@ -275,7 +275,7 @@ private:
     cudaStream_t stream_;
     Dist dist_;
     bool spec_ = false;
-    MxScaleLayout lx_, lw_;
+    BlockScaleLayout lx_, lw_;
 
     size_t num_bufs_ = 1, buf_idx_ = 0;
     std::vector<CUDABuffer<fp8e4m3>> X_, W_;

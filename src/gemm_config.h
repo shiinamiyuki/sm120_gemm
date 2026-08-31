@@ -26,17 +26,34 @@ using Fp8GemmKernelFn = void (*)(int M, int N, int K,
                                  float x_scale, float w_scale,
                                  float *workspace, cudaStream_t stream);
 // MXFP8 carries block-scale *tensors* instead of two scalars; they are the
-// swizzled ue8m0 layout described in mxfp8_scale.h.
+// swizzled ue8m0 layout described in block_scale.h.
 using MxFp8GemmKernelFn = void (*)(int M, int N, int K,
                                    const void *X, const void *W, void *Y,
                                    const void *x_sf, const void *w_sf,
                                    float *workspace, cudaStream_t stream);
+// W4A16: bf16 activations, NVFP4 weights (packed e2m1 + swizzled ue4m3 per 16
+// elements + one fp32 global scale). Only the weights carry a scale.
+using W4A16GemmKernelFn = void (*)(int M, int N, int K,
+                                   const void *X, const void *W, void *Y,
+                                   const void *w_sf, float w_global,
+                                   float *workspace, cudaStream_t stream);
+// W4A4: both operands NVFP4, so two swizzled ue4m3 tensors, and the two fp32
+// globals arrive pre-multiplied as one out_scale (the MMA has already taken
+// both per-16 block scales).
+using W4A4GemmKernelFn = void (*)(int M, int N, int K,
+                                  const void *X, const void *W, void *Y,
+                                  const void *x_sf, const void *w_sf, float out_scale,
+                                  float *workspace, cudaStream_t stream);
 
 // Which kernel template a config instantiates. Both share the producer /
 // TMA / mbarrier pipeline and differ only in the consumer.
 enum class KernelFamily {
-    Mma,   // {BF16,FP8}GemmMMA   — tensor cores, requires M % BM == 0
-    TinyM, // {BF16,FP8}GemmTinyM — CUDA cores, for M <= BM (skinny GEMM)
+    Mma,     // {BF16,FP8}GemmMMA   — tensor cores, requires M % BM == 0
+    TinyM,   // {BF16,FP8}GemmTinyM — CUDA cores, for M <= BM (skinny GEMM)
+    TinyMTC, // W4A16GemmTinyMTC    — tensor cores at decode M, BM fixed at 16.
+             // Same skinny-GEMM shape as TinyM, but the mainloop is
+             // mma.m16n8k16 rather than per-row FMAs, so its cost stops
+             // growing with M. W4A16 only.
 };
 
 // Operand element type. The two share every kernel template; what changes is
@@ -46,6 +63,8 @@ enum class ElemType {
     Bf16,
     Fp8,   // e4m3, one scale for the whole tensor
     MxFp8, // e4m3, one ue8m0 scale per 32 elements along K (OCP microscaling)
+    W4A16, // bf16 activations x NVFP4 weights (e2m1 + ue4m3 per 16 + fp32)
+    W4A4,  // NVFP4 on both sides; sm_120a has a native block-scaled e2m1 MMA
 };
 
 // ── GEMM configuration ─────────────────────────────────────────────────
@@ -65,6 +84,12 @@ enum class ElemType {
 //
 //     tinym_8x256x64_s2_cwg1_sk8
 //
+// "tinymtc" is the tensor-core skinny family (W4A16 only). Same shape, but the
+// mainloop is mma.m16n8k16, so BM is pinned at 16 and the warp tile is again
+// implicit -- each consumer warp takes BN/(CWG*4) columns:
+//
+//     w4a16_tinymtc_16x128x256_s3_cwg1_sk8
+//
 // FP8 configs carry a leading "fp8" token, before the family token:
 //
 //     fp8_128x128x128_s2_cwg2_w64x32_sk1
@@ -78,16 +103,33 @@ struct GemmConfig {
     int stages = 3, cwg = 2;
     int warp_m = 0, warp_n = 0; // 0 = derive from bm/bn/cwg (Mma only)
     int split_k = 1;
-    // Last members so the aggregate initialisers below keep working.
+    // Last members so the positional aggregate initialisers below keep working
+    // -- enumerate_mma builds a GemmConfig as {bm, bn, bk, stages, cwg, wm, wn,
+    // sk, family, elem}, so anything inserted above this line silently shifts
+    // what those braces mean. Add new fields at the end.
     KernelFamily family = KernelFamily::Mma;
     ElemType elem = ElemType::Bf16;
+    // W4A4 only: how many column slices the epilogue stores in. Packed 4-bit
+    // operands make a full BM x BN bf16 Y_out the largest thing in shared
+    // memory, so slicing it is what lets BM=BN=128 fit at all.
+    int y_slices = 1;
 
     bool is_tiny_m() const { return family == KernelFamily::TinyM; }
+    bool is_tiny_m_tc() const { return family == KernelFamily::TinyMTC; }
+    // Both skinny families take M <= BM and carry no warp tile in their name.
+    bool is_skinny() const { return is_tiny_m() || is_tiny_m_tc(); }
     // Both fp8 flavours store e4m3, so everything the element size implies —
     // BK, the MMA k-extent, the vector width — is shared. Only where the
     // scale comes from differs.
     bool is_fp8() const { return elem == ElemType::Fp8 || elem == ElemType::MxFp8; }
     bool is_mx() const { return elem == ElemType::MxFp8; }
+    // The two operands have different widths here, so elem_bytes() below is
+    // the activation side; anything that needs the weight side asks directly.
+    bool is_w4a16() const { return elem == ElemType::W4A16; }
+    bool is_w4a4() const { return elem == ElemType::W4A4; }
+    // Anything storing packed e2m1 has half-byte elements, so a BK-wide row is
+    // BK/2 bytes rather than BK*elem_bytes().
+    bool is_packed4() const { return is_w4a16() || is_w4a4(); }
     int elem_bytes() const { return is_fp8() ? 1 : 2; }
     // k covered by one MMA instruction: m16n8k16 for bf16, m16n8k32 for e4m3.
     int mma_k() const { return is_fp8() ? 32 : 16; }
@@ -96,10 +138,17 @@ struct GemmConfig {
 
     std::string name() const {
         char buf[128];
-        const char *dt = is_mx() ? "mxfp8_" : is_fp8() ? "fp8_" : "";
-        if (is_tiny_m())
-            snprintf(buf, sizeof(buf), "%stinym_%dx%dx%d_s%d_cwg%d_sk%d",
-                     dt, bm, bn, bk, stages, cwg, split_k);
+        const char *dt = is_w4a4()    ? "w4a4_"
+                         : is_w4a16() ? "w4a16_"
+                         : is_mx()    ? "mxfp8_"
+                         : is_fp8()   ? "fp8_" : "";
+        if (is_w4a4())
+            snprintf(buf, sizeof(buf), "%s%dx%dx%d_s%d_cwg%d_w%dx%d_ys%d_sk%d",
+                     dt, bm, bn, bk, stages, cwg, warp_m, warp_n, y_slices, split_k);
+        else if (is_skinny())
+            snprintf(buf, sizeof(buf), "%s%s_%dx%dx%d_s%d_cwg%d_sk%d",
+                     dt, is_tiny_m_tc() ? "tinymtc" : "tinym",
+                     bm, bn, bk, stages, cwg, split_k);
         else
             snprintf(buf, sizeof(buf), "%s%dx%dx%d_s%d_cwg%d_w%dx%d_sk%d",
                      dt, bm, bn, bk, stages, cwg, warp_m, warp_n, split_k);
@@ -125,9 +174,33 @@ struct GemmConfig {
         if (stages < 2) return fail("NUM_STAGES=%d must be >= 2 to pipeline", stages);
         if (cwg < 1) return fail("CWG=%d must be >= 1", cwg);
         if (split_k < 1) return fail("SPLIT_K=%d must be >= 1", split_k);
-        if (bk * elem_bytes() < 128)
+        if (is_packed4()) {
+            // A BK-wide row of packed e2m1 is BK/2 bytes, and the 128B swizzle
+            // that makes the per-n reads conflict-free needs 128 of them. W4A4
+            // additionally needs BK to be a multiple of the MMA's k=64, which
+            // 256 already satisfies.
+            if (bk != 256)
+                return fail("%s requires BK=256 (got %d)", is_w4a4() ? "W4A4" : "W4A16", bk);
+        } else if (bk * elem_bytes() < 128) {
             return fail("BK=%d gives a %d-byte K row; 128B swizzle needs >= 128",
                         bk, bk * elem_bytes());
+        }
+
+        if (is_tiny_m_tc()) {
+            // Mirrors the static_asserts in W4A16GemmTinyMTC.
+            if (!is_w4a16())
+                return fail("the tinymtc family exists only for W4A16 (elem=%d)", (int)elem);
+            if (bm != 16)
+                return fail("tinymtc fixes BM at 16 (mma.m16), got %d", bm);
+            if (bn > 256) return fail("TMA box dims are capped at 256 (got BN=%d)", bn);
+            const int cwarps = cwg * 4;
+            if (bn % cwarps)
+                return fail("BN=%d must split over the %d consumer warps", bn, cwarps);
+            if ((bn / cwarps) % 8)
+                return fail("BN/%d = %d must be a multiple of 8 (mma.n8)",
+                            cwarps, bn / cwarps);
+            return {};
+        }
 
         if (is_tiny_m()) {
             // Mirrors the static_asserts in {BF16,FP8}GemmTinyM.
@@ -143,6 +216,24 @@ struct GemmConfig {
                 return fail("BN=%d < %d consumer threads; raise BN or lower CWG",
                             bn, consumer_threads());
             return {};
+        }
+
+        if (is_w4a4()) {
+            // Mirrors the static_asserts in W4A4GemmMMA.
+            if (family != KernelFamily::Mma)
+                return fail("W4A4 has only the tensor-core family (no tiny-M)");
+            if (split_k != 1)
+                return fail("the W4A4 kernel has no split-k path (got sk%d)", split_k);
+            if (y_slices < 1) return fail("ys%d must be >= 1", y_slices);
+            if (bn % y_slices) return fail("BN=%d not divisible by ys%d", bn, y_slices);
+            if ((bn / y_slices) % 8)
+                return fail("output slice BN/ys = %d must be a multiple of 8",
+                            bn / y_slices);
+            if (bn / y_slices > 256)
+                return fail("output slice BN/ys = %d exceeds the 256 TMA box cap",
+                            bn / y_slices);
+        } else if (y_slices != 1) {
+            return fail("ys%d is a W4A4-only knob", y_slices);
         }
 
         // The fp8 MMA kernel has no split-k epilogue; tiny-M covers the skinny
@@ -172,7 +263,7 @@ struct GemmConfig {
         // Tiny-M does not tile M: one row-tile covers it, with TMA zero-filling
         // rows >= M. That also keeps these configs out of the running for any
         // shape they were not meant for.
-        if (is_tiny_m()) return M <= bm;
+        if (is_skinny()) return M <= bm;
         return M % bm == 0;
     }
 
@@ -181,6 +272,23 @@ struct GemmConfig {
     size_t smem_bytes() const {
         size_t barriers = 2 * (size_t)stages * sizeof(uint64_t);
         size_t esz = (size_t)elem_bytes();
+        if (is_w4a4()) {
+            // Packed operands (BK/2 bytes per row), both scale tensors staged
+            // as 512-byte tiles, and a Y_out of only BM x (BN/ys).
+            const size_t row = (size_t)bk / 2;
+            size_t tile = (size_t)stages * ((size_t)bm * row + (size_t)bn * row);
+            const size_t packs = (size_t)bk / 64;
+            const size_t x_tiles = ((size_t)bm + 127) / 128, w_tiles = ((size_t)bn + 127) / 128;
+            tile += (size_t)stages * packs * (x_tiles + w_tiles) * 512;
+            const size_t y_out = (size_t)bm * (bn / y_slices) * sizeof(bf16);
+            return tile + y_out + barriers;
+        }
+        if (is_skinny() && is_w4a16()) {
+            // bf16 X (unswizzled, so no row padding) plus packed e2m1 W.
+            size_t tile = (size_t)stages * ((size_t)bm * bk * sizeof(bf16) +
+                                            (size_t)bn * (bk / 2));
+            return tile + barriers;
+        }
         if (is_tiny_m()) {
             // The X stage stride is padded up to a whole 8-row (1024B) block
             // so every stage lands on the same 128B-swizzle phase.
@@ -247,7 +355,9 @@ struct GemmConfig {
             auto bad = [&](const char *want) {
                 return set_err("bad token '" + std::string(tok) + "' (want " + want + ")");
             };
-            if (tok == "tinym") {
+            if (tok == "tinymtc") {
+                c.family = KernelFamily::TinyMTC;
+            } else if (tok == "tinym") {
                 c.family = KernelFamily::TinyM;
             } else if (tok == "mma") {
                 c.family = KernelFamily::Mma;
@@ -255,6 +365,12 @@ struct GemmConfig {
                 c.elem = ElemType::Fp8;
             } else if (tok == "mxfp8") {
                 c.elem = ElemType::MxFp8;
+            } else if (tok == "w4a16") {
+                c.elem = ElemType::W4A16;
+            } else if (tok == "w4a4") {
+                c.elem = ElemType::W4A4;
+            } else if (tok.rfind("ys", 0) == 0) {
+                if (!scan_tail(tok, 2, c.y_slices)) return bad("ys<n>");
             } else if (tok == "bf16") {
                 c.elem = ElemType::Bf16;
             } else if (tok.rfind("sk", 0) == 0) {
@@ -289,7 +405,7 @@ struct GemmConfig {
         // depends on the element size — so it can only be applied once the whole
         // token list has been seen (tokens may appear in any order).
         if (!have_bk) c.bk = 128 / c.elem_bytes();
-        if (c.is_tiny_m()) {
+        if (c.is_skinny()) {
             if (c.warp_m || c.warp_n)
                 return set_err("config '" + std::string(s) +
                                "' sets a warp tile, which the tiny-M family has no use for");
@@ -309,6 +425,8 @@ struct GemmConfig {
     static std::vector<GemmConfig> enumerate(size_t max_smem, ElemType elem = ElemType::Bf16) {
         std::vector<GemmConfig> out = enumerate_mma(max_smem, elem);
         for (auto &c : enumerate_tiny_m(max_smem, elem)) out.push_back(c);
+        for (auto &c : enumerate_tiny_m_tc(max_smem, elem)) out.push_back(c);
+        for (auto &c : enumerate_w4a4(max_smem, elem)) out.push_back(c);
         return out;
     }
 
@@ -318,7 +436,9 @@ struct GemmConfig {
     // measurably so, see the ncu notes in README.
     static std::vector<GemmConfig> enumerate_tiny_m(size_t max_smem,
                                                     ElemType elem = ElemType::Bf16) {
-        const int bk0 = elem == ElemType::Bf16 ? 64 : 128;
+        const int bk0 = elem == ElemType::Bf16    ? 64
+                        : elem == ElemType::W4A16 ? 256
+                                                  : 128;
         std::vector<GemmConfig> out;
         for (int bm : {1, 2, 4, 8})
             for (int bn : {128, 256})
@@ -339,6 +459,64 @@ struct GemmConfig {
                                 if (c.smem_bytes() > max_smem) continue;
                                 out.push_back(c);
                             }
+        return out;
+    }
+
+    // Tensor-core skinny family. BM is fixed at 16 by mma.m16, so unlike
+    // tiny-M there is no BM to sweep: one config serves every M <= 16, and the
+    // padding rows cost nothing because the MMA computes them regardless.
+    static std::vector<GemmConfig> enumerate_tiny_m_tc(size_t max_smem,
+                                                       ElemType elem = ElemType::Bf16) {
+        std::vector<GemmConfig> out;
+        if (elem != ElemType::W4A16) return out;
+        for (int bn : {64, 128, 256})
+            for (int cwg : {1, 2})
+                for (int sk : {1, 2, 4, 8, 16})
+                    for (int stages : {5, 4, 3, 2}) {
+                        GemmConfig c{};
+                        c.family = KernelFamily::TinyMTC;
+                        c.elem = elem;
+                        c.bm = 16;
+                        c.bn = bn;
+                        c.bk = 256;
+                        c.stages = stages;
+                        c.cwg = cwg;
+                        c.split_k = sk;
+                        if (!c.validate().empty()) continue;
+                        if (c.smem_bytes() > max_smem) continue;
+                        out.push_back(c);
+                    }
+        return out;
+    }
+
+    // W4A4's tensor-core family. Only the output-slice count is new; ys is
+    // swept because it trades shared memory against epilogue stores, and which
+    // way that trade goes depends on whether the shape can fill the machine at
+    // the larger tile it buys.
+    static std::vector<GemmConfig> enumerate_w4a4(size_t max_smem,
+                                                  ElemType elem = ElemType::Bf16) {
+        std::vector<GemmConfig> out;
+        if (elem != ElemType::W4A4) return out;
+        for (int bm : {64, 128})
+            for (int bn : {64, 128})
+                for (int cwg : {1, 2})
+                    for (int ys : {1, 2, 4})
+                        for (int stages : {4, 3, 2}) {
+                            GemmConfig c{};
+                            c.family = KernelFamily::Mma;
+                            c.elem = elem;
+                            c.bm = bm;
+                            c.bn = bn;
+                            c.bk = 256;
+                            c.stages = stages;
+                            c.cwg = cwg;
+                            c.y_slices = ys;
+                            c.split_k = 1;
+                            if (!c.derive_warp_tile()) continue;
+                            if (!c.validate().empty()) continue;
+                            if (c.smem_bytes() > max_smem) continue;
+                            out.push_back(c);
+                        }
         return out;
     }
 

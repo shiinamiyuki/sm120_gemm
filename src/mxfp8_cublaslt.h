@@ -1,6 +1,6 @@
 #pragma once
 #include "common.h"
-#include "mxfp8_scale.h"
+#include "block_scale.h"
 
 #include <cublasLt.h>
 #include <cuda_bf16.h>
@@ -59,14 +59,14 @@ using fp8e4m3 = __nv_fp8_e4m3;
 // Not row-major. cuBLASLt wants the swizzled layout the Blackwell tensor
 // cores consume directly (the same one CUTLASS calls the SFA/SFB layout).
 // Reverse-engineered by bit-plane probing; the formula lives in
-// mxfp8_scale.h, and `bench_mxfp8 --probe-layout` re-derives it against the
+// block_scale.h, and `bench_mxfp8 --probe-layout` re-derives it against the
 // hardware on a new toolkit.
 
 // ── The baseline ──────────────────────────────────────────────────────
 class MxFp8GemmLt {
 public:
     // w_sf / x_sf are device pointers to swizzled scale tensors laid out by
-    // MxScaleLayout(N, K) and MxScaleLayout(M, K) respectively.
+    // BlockScaleLayout(N, K) and BlockScaleLayout(M, K) respectively.
     MxFp8GemmLt(int M, int N, int K, const void *w_sf, const void *x_sf,
                 bool fast_accum = false, size_t workspace_bytes = 32u << 20)
         : M_(M), N_(N), K_(K), ws_bytes_(workspace_bytes) {

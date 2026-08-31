@@ -51,9 +51,30 @@ inline JitOptions mxfp8_jit_options() {
     JitOptions o;
     o.entry = "mxfp8_kernel_entry.cu";
     o.fingerprint_sources = {"mxfp8_kernel_entry.cu", "mxfp8_gemm.cuh",
-                             "mxfp8_gemm_tinym.cuh", "mxfp8_mma.cuh", "mxfp8_scale.h",
+                             "mxfp8_gemm_tinym.cuh", "mxfp8_mma.cuh", "block_scale.h",
                              "fp8_gemm_tinym.cuh", "fp8_gemm.cuh",
                              "bf16_gemm.cuh", "common.h"};
+    return o;
+}
+
+// W4A16 kernels: bf16 activations against NVFP4 weights. Only the tiny-M
+// family exists -- tensor cores have no mixed 4-bit x 16-bit MMA, so an MMA
+// family would have to dequantize to bf16 first.
+inline JitOptions w4a16_jit_options() {
+    JitOptions o;
+    o.entry = "w4a16_kernel_entry.cu";
+    o.fingerprint_sources = {"w4a16_kernel_entry.cu", "w4a16_gemm_tinym.cuh",
+                             "block_scale.h", "bf16_gemm.cuh", "common.h"};
+    return o;
+}
+
+// W4A4 kernels: NVFP4 on both sides. Only the tensor-core family exists --
+// sm_120a's block-scaled e2m1 MMA consumes packed operands directly.
+inline JitOptions w4a4_jit_options() {
+    JitOptions o;
+    o.entry = "w4a4_kernel_entry.cu";
+    o.fingerprint_sources = {"w4a4_kernel_entry.cu", "w4a4_gemm.cuh", "nvfp4_mma.cuh",
+                             "block_scale.h", "fp8_gemm.cuh", "bf16_gemm.cuh", "common.h"};
     return o;
 }
 
@@ -228,6 +249,8 @@ private:
             << " -DGEMM_WN=" << cfg.warp_n
             << " -DGEMM_SPLIT_K=" << cfg.split_k
             << " -DGEMM_TINYM=" << (cfg.is_tiny_m() ? 1 : 0)
+            << " -DGEMM_TINYM_TC=" << (cfg.is_tiny_m_tc() ? 1 : 0)
+            << " -DGEMM_YS=" << cfg.y_slices
             << " \"" << opts_.src_dir << "/" << opts_.entry << '"'
             << " -o \"" << tmp << '"'
             << " -L\"" << opts_.cuda_stub_dir << "\" -lcuda"
@@ -333,3 +356,7 @@ using Fp8KernelJit = KernelJitT<Fp8GemmKernelFn>;
 using Fp8CompiledKernel = CompiledKernelT<Fp8GemmKernelFn>;
 using MxFp8KernelJit = KernelJitT<MxFp8GemmKernelFn>;
 using MxFp8CompiledKernel = CompiledKernelT<MxFp8GemmKernelFn>;
+using W4A16KernelJit = KernelJitT<W4A16GemmKernelFn>;
+using W4A16CompiledKernel = CompiledKernelT<W4A16GemmKernelFn>;
+using W4A4KernelJit = KernelJitT<W4A4GemmKernelFn>;
+using W4A4CompiledKernel = CompiledKernelT<W4A4GemmKernelFn>;
